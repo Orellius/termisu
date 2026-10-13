@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Builds the shipped artifact: libtermisu-vt.a, with the hyphen.
+#
+# Cargo cannot emit that name. A package called `libtermisu-vt` produces liblibtermisu_vt.a, and
+# `[lib] name = "termisu-vt"` is a hard cargo error -- "library target names cannot contain
+# hyphens". So the crate is named termisu_vt, cargo emits libtermisu_vt.a, and this renames it, so
+# a consumer's link flag reads `-ltermisu-vt` and mirrors `-lghostty-vt` exactly.
+#
+# Also verifies the archive actually exports the ABI. A drop-in that silently stopped
+# exporting a symbol would fail at the consumer's link step, which is the worst place to find
+# out, and no cargo test can see it because the symbols only reach the archive at build time.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROFILE="${1:-release}"
+DEPLOYMENT_TARGET="${TERMISU_MACOS_DEPLOYMENT_TARGET:-13.0}"
+BUILD_ROOT="$ROOT/target/macos-$DEPLOYMENT_TARGET"
+cd "$ROOT"
+
+case "$PROFILE" in
+  release) CARGO_TARGET_DIR="$BUILD_ROOT" MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+    "$ROOT/scripts/cargo.sh" \
+    build --release -p termisu-vt-abi ;;
+  debug)   CARGO_TARGET_DIR="$BUILD_ROOT" MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+    "$ROOT/scripts/cargo.sh" \
+    build -p termisu-vt-abi ;;
+  *) echo "usage: $0 [release|debug]" >&2; exit 2 ;;
+esac
+
+OUT="target/$PROFILE"
+SRC="$BUILD_ROOT/$PROFILE/libtermisu_vt.a"
+DST="$OUT/libtermisu-vt.a"
+
+if [ ! -f "$SRC" ]; then
+  echo "cargo did not produce $SRC" >&2
+  exit 1
+fi
+mkdir -p "$OUT"
+cp "$SRC" "$DST"
+"$ROOT/scripts/check-macos-deployment-target.sh" "$DST" "$DEPLOYMENT_TARGET"
+
+# TWO surfaces, and both are checked because each carries a different claim.
+#
+#   termisu_vt_*  is ours, declared by our own include/termisu_vt.h. Missing one means a consumer
+#                who linked us by our own name gets an undefined symbol.
+#   ghostty_*    is the drop-in claim the differential corpus earns. Missing one means this
+#                archive can no longer stand in behind something built for that ABI, whatever
+#                the tests say.
+#
+# They are the same functions: crates/abi/src/native.rs is a thin forward, so a mismatch in
+# COUNT between the two lists below means somebody added an entry point to one surface only.
+EXPECTED=(
+  termisu_vt_terminal_new
+  termisu_vt_terminal_free
+  termisu_vt_terminal_vt_write
+  termisu_vt_terminal_resize
+  termisu_vt_terminal_get
+  termisu_vt_terminal_mode_get
+  termisu_vt_terminal_grid_ref
+  termisu_vt_grid_ref_cell
+  termisu_vt_grid_ref_row
+  termisu_vt_grid_ref_graphemes
+  termisu_vt_grid_ref_style
+  termisu_vt_cell_get
+  termisu_vt_row_get
+  termisu_vt_style_default
+  ghostty_terminal_new
+  ghostty_terminal_free
+  ghostty_terminal_vt_write
+  ghostty_terminal_resize
+  ghostty_terminal_get
+  ghostty_terminal_mode_get
+  ghostty_terminal_grid_ref
+  ghostty_grid_ref_cell
+  ghostty_grid_ref_row
+  ghostty_grid_ref_graphemes
+  ghostty_grid_ref_style
+  ghostty_cell_get
+  ghostty_row_get
+  ghostty_style_default
+)
+
+# The symbol table is captured once rather than piped per symbol. `nm` exits non-zero on
+# archive members that carry no symbols, and under `set -o pipefail` that sinks the whole
+# pipeline even when grep matched -- which reported all 13 exports missing while every one of
+# them was present.
+SYMBOLS="$(mktemp)"
+trap 'rm -f "$SYMBOLS"' EXIT
+nm -gU "$DST" 2>/dev/null > "$SYMBOLS" || true
+
+missing=0
+for symbol in "${EXPECTED[@]}"; do
+  if ! grep -qE "^[0-9a-f]+ T _?$symbol\$" "$SYMBOLS"; then
+    echo "MISSING export: $symbol" >&2
+    missing=$((missing + 1))
+  fi
+done
+
+if [ "$missing" -ne 0 ]; then
+  echo "$missing of ${#EXPECTED[@]} exports missing; this archive is not a drop-in" >&2
+  exit 1
+fi
+
+echo "built $DST"
+echo "  exports  ${#EXPECTED[@]}/${#EXPECTED[@]} verified"
+echo "  link as  -L$ROOT/$OUT -ltermisu-vt"
+echo "  headers  crates/abi/include/termisu_vt.h (ours) + ghostty/vt/*.h (drop-in)"

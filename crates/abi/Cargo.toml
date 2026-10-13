@@ -1,0 +1,22 @@
+[package]
+name = "termisu-vt-abi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The C ABI termisu-vt publishes, matching the subset of libghostty-vt it is gated against."
+
+[lib]
+name = "termisu_vt"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+termisu-vt-abi-types = { path = "../abi-types", version = "0.1.0" }
+termisu-vt-core = { path = "../core", version = "0.1.0" }
+termisu-vt-snapshot = { path = "../snapshot", version = "0.1.0" }
+
+[dev-dependencies]
+serde = { workspace = true }
+toml = { workspace = true }

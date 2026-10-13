@@ -1,0 +1,9 @@
+[package]
+name = "termisu-vt-abi-types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The C types termisu-vt publishes, laid out to match ghostty/vt/*.h exactly."

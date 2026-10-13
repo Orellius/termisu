@@ -1,0 +1,351 @@
+//! S2 compat harness: the integration's marks must survive a shell whose own precmd
+//! regenerates PROMPT after ours ran.
+//!
+//! The live failure (measured in the operator's .zshrc, 2026-07-30): starship's
+//! transient-prompt setup registers a precmd that overwrites PROMPT from a saved copy
+//! every cycle. The old integration appended its B mark to PROMPT from a hook registered
+//! at .zshenv time -- which runs FIRST, so any later-registered hook that rewrites PROMPT
+//! silently deletes the input mark and every block goes dark.
+//!
+//! The test spawns a real interactive zsh through the C surface with a hostile rc that
+//! reproduces exactly that shape, then asks `termisu_host_row_text` with the input filter
+//! whether the typed command is still input-marked. Run against the old integration this
+//! fails (seen 2026-07-30); the control below proves the marks come from the integration
+//! and not from zsh itself.
+
+use std::ffi::CString;
+use std::path::PathBuf;
+use std::ptr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use termisu_vt_host::{
+    TermisuHost, TermisuHostFrame, TermisuHostOptions, TermisuHostResult, termisu_host_free,
+    termisu_host_poll, termisu_host_row_text, termisu_host_send, termisu_host_spawn,
+};
+
+const COLS: u16 = 80;
+const ROWS: u16 = 24;
+const PATIENCE: Duration = Duration::from_secs(15);
+
+/// Child env is process-global at spawn time, so tests that set it serialize here.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn repo_shell_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell")
+}
+
+/// A HOME whose .zshrc reproduces the starship shape: a precmd, registered after the
+/// integration's (user rc loads after .zshenv), that rewrites PROMPT every cycle.
+fn hostile_home() -> PathBuf {
+    let home = std::env::temp_dir().join(format!("termisu-hostile-home-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("temp home");
+    std::fs::write(
+        home.join(".zshrc"),
+        "PROMPT='H> '\n_hostile_restore() { PROMPT='H> ' }\nprecmd_functions+=(_hostile_restore)\n",
+    )
+    .expect("hostile zshrc");
+    home
+}
+
+fn empty_frame() -> TermisuHostFrame {
+    TermisuHostFrame {
+        pixels: ptr::null(),
+        width: 0,
+        height: 0,
+        generation: 0,
+        drew: false,
+        child_exited: false,
+        background: [0; 4],
+        row_semantics: ptr::null(),
+        row_count: 0,
+        viewport_offset: 0,
+        cursor_col: 0,
+        cursor_row: 0,
+        cursor_visible: false,
+    }
+}
+
+/// Tolerant variant for polling: `row_text` answers from the last POLLED frame, so this
+/// polls first, and before the pump publishes its first frame it returns None ("not
+/// yet", not "wrong").
+fn try_text_of(host: *mut TermisuHost, row: u16, semantic: u8) -> Option<String> {
+    let mut polled = empty_frame();
+    if unsafe { termisu_host_poll(host, &mut polled) } != TermisuHostResult::Success {
+        return None;
+    }
+    let mut len = 0usize;
+    let probe = unsafe { termisu_host_row_text(host, row, semantic, ptr::null_mut(), 0, &mut len) };
+    if probe != TermisuHostResult::Success {
+        return None;
+    }
+    let mut buffer = vec![0u8; len];
+    let read =
+        unsafe { termisu_host_row_text(host, row, semantic, buffer.as_mut_ptr(), len, &mut len) };
+    if read != TermisuHostResult::Success {
+        return None;
+    }
+    String::from_utf8(buffer).ok()
+}
+
+fn text_of(host: *mut TermisuHost, row: u16, semantic: u8) -> String {
+    let mut len = 0usize;
+    assert_eq!(
+        unsafe { termisu_host_row_text(host, row, semantic, ptr::null_mut(), 0, &mut len) },
+        TermisuHostResult::Success
+    );
+    let mut buffer = vec![0u8; len];
+    assert_eq!(
+        unsafe { termisu_host_row_text(host, row, semantic, buffer.as_mut_ptr(), len, &mut len) },
+        TermisuHostResult::Success
+    );
+    String::from_utf8(buffer).expect("row text is UTF-8")
+}
+
+fn row_classes(host: *mut TermisuHost) -> Vec<u8> {
+    let mut polled = empty_frame();
+    assert_eq!(
+        unsafe { termisu_host_poll(host, &mut polled) },
+        TermisuHostResult::Success
+    );
+    if polled.row_semantics.is_null() {
+        return Vec::new();
+    }
+    unsafe { std::slice::from_raw_parts(polled.row_semantics, polled.row_count as usize) }.to_vec()
+}
+
+fn wait_for<F: FnMut() -> bool>(mut done: F, what: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        if done() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn send(host: *mut TermisuHost, bytes: &[u8]) {
+    assert_eq!(
+        unsafe { termisu_host_send(host, bytes.as_ptr(), bytes.len()) },
+        TermisuHostResult::Success
+    );
+}
+
+fn spawn_zsh(with_integration: bool) -> *mut TermisuHost {
+    let shell = repo_shell_dir().canonicalize().expect("shell dir");
+    let home = hostile_home();
+    // Env mutation is process-global; the lock is held only across spawn, and the child
+    // gets its own copy at fork.
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("TERMISU_USER_ZDOTDIR");
+        // The hostile home isolates the USER's rc files and nothing else. `/etc/zshrc` runs
+        // regardless of ZDOTDIR, and its line 74 sources `/etc/zshrc_$TERM_PROGRAM` - so a suite
+        // run from Terminal.app inherits `TERM_PROGRAM=Apple_Terminal`, loads Apple's own shell
+        // integration, and that file emits OSC 7 itself. The control then reports "an
+        // unintegrated zsh reported a working directory", which is TRUE and about the wrong
+        // integration. Measured 2026-08-11: red from Terminal.app, green under `env -u
+        // TERM_PROGRAM`, same commit. Scrubbed here so the control is a statement about OUR
+        // file rather than about which terminal the developer happened to be sitting in.
+        std::env::remove_var("TERM_PROGRAM");
+        if with_integration {
+            std::env::set_var("ZDOTDIR", shell.join("zdotdir"));
+            std::env::set_var("TERMISU_INTEGRATION", shell.join("termisu-integration.zsh"));
+        } else {
+            std::env::set_var("ZDOTDIR", &home);
+            std::env::remove_var("TERMISU_INTEGRATION");
+        }
+    }
+    let command = CString::new("exec zsh -i").expect("command");
+    let options = TermisuHostOptions {
+        cols: COLS,
+        rows: ROWS,
+        font_size: 0.0,
+        command: command.as_ptr(),
+        auto_direction: false,
+        config: ptr::null(),
+        cwd: ptr::null(),
+    };
+    let mut host: *mut TermisuHost = ptr::null_mut();
+    assert_eq!(
+        unsafe { termisu_host_spawn(&options, &mut host) },
+        TermisuHostResult::Success
+    );
+    host
+}
+
+/// The pair's positive half: under a PROMPT-rewriting precmd, the SECOND prompt cycle
+/// (the first is marked before the hostile hook exists in its final order) must still
+/// carry the A mark in its prompt and the B mark before the typed command -- which is
+/// only possible if the integration re-marks the theme's PROMPT after the theme runs.
+#[test]
+fn input_marks_survive_a_prompt_rewriting_precmd() {
+    let host = spawn_zsh(true);
+
+    // First prompt settles.
+    wait_for(
+        || try_text_of(host, 0, 255).is_some_and(|text| text.starts_with("H>")),
+        "the first prompt",
+    );
+    // An empty Enter reaches the second cycle, where hook order is final.
+    send(host, b"\r");
+    wait_for(
+        || try_text_of(host, 1, 255).is_some_and(|text| text.starts_with("H>")),
+        "the second prompt",
+    );
+    send(host, b"echo hi\r");
+    wait_for(
+        || try_text_of(host, 1, 255).is_some_and(|text| text.contains("echo hi")),
+        "the typed command to echo",
+    );
+
+    let classes = row_classes(host);
+    assert_eq!(
+        classes.get(1),
+        Some(&1),
+        "the second prompt row must classify as prompt (A survived the rewrite)"
+    );
+    // The discriminating read: with B wiped by the hostile precmd, the typed command is
+    // prompt-marked and this filter returns "" -- the old integration fails exactly here.
+    assert_eq!(
+        text_of(host, 1, 2),
+        "echo hi",
+        "the typed command must be input-marked (B survived the rewrite)"
+    );
+    assert_eq!(
+        text_of(host, 1, 1),
+        "H>",
+        "the prompt filter keeps only the theme's own cells"
+    );
+    unsafe { termisu_host_free(host) };
+}
+
+/// The pair's control: the same hostile shell WITHOUT the integration must produce no
+/// prompt-classed rows and no input-marked cells. Together with the positive half this
+/// proves the marks come from the integration script, not from zsh or the classifier.
+#[test]
+fn without_the_integration_nothing_is_marked() {
+    let host = spawn_zsh(false);
+
+    wait_for(
+        || try_text_of(host, 0, 255).is_some_and(|text| text.starts_with("H>")),
+        "the first prompt",
+    );
+    send(host, b"echo hi\r");
+    wait_for(
+        || try_text_of(host, 0, 255).is_some_and(|text| text.contains("echo hi")),
+        "the typed command to echo",
+    );
+
+    let classes = row_classes(host);
+    assert!(
+        classes.iter().all(|&class| class == 0),
+        "no integration, no prompt rows -- got {classes:?}"
+    );
+    assert_eq!(
+        text_of(host, 0, 2),
+        "",
+        "no integration, no input-marked cells"
+    );
+    unsafe { termisu_host_free(host) };
+}
+
+/// OSC 7 reaches the event seam from a REAL zsh running our integration.
+///
+/// The unit tests prove the decoder and the store; the pairing test in `cwd.rs` pins the
+/// exact bytes a zsh produced ONCE, by hand. Neither notices if the integration stops
+/// emitting -- and nothing else in our windows emits OSC 7 at all, because macOS installs
+/// `update_terminal_cwd` only when $TERM_PROGRAM is Apple_Terminal, which we never set.
+/// So this drives the real shell and waits for the real event.
+///
+/// The control is the other half of the pair below: without the integration, no report
+/// ever arrives, which is what proves the report comes from our file and not from zsh.
+#[test]
+fn the_integration_reports_the_working_directory() {
+    use termisu_vt_host::termisu_host_next_event;
+
+    let host = spawn_zsh(true);
+    let deadline = Instant::now() + PATIENCE;
+    let mut seen: Option<Vec<u8>> = None;
+    while Instant::now() < deadline && seen.is_none() {
+        let mut polled = empty_frame();
+        assert_eq!(
+            unsafe { termisu_host_poll(host, &mut polled) },
+            TermisuHostResult::Success
+        );
+        loop {
+            let (mut kind, mut len) = (0u32, 0usize);
+            assert_eq!(
+                unsafe { termisu_host_next_event(host, &mut kind, ptr::null_mut(), 0, &mut len) },
+                TermisuHostResult::Success
+            );
+            if kind == 0 {
+                break;
+            }
+            let mut buffer = vec![0u8; len.max(1)];
+            let mut fetched = 0u32;
+            assert_eq!(
+                unsafe {
+                    termisu_host_next_event(host, &mut fetched, buffer.as_mut_ptr(), len, &mut len)
+                },
+                TermisuHostResult::Success
+            );
+            if kind == 7 && len > 0 {
+                seen = Some(buffer[..len].to_vec());
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { termisu_host_free(host) };
+
+    let report = seen.expect("the integration never reported a working directory");
+    let text = String::from_utf8(report).expect("the report is UTF-8");
+    assert!(
+        text.starts_with("file://"),
+        "OSC 7 must report a file:// URI, got {text:?}"
+    );
+    assert!(
+        text.contains('/'),
+        "the URI must carry a path, got {text:?}"
+    );
+    // Percent-encoded, so a directory with a space in it survives the trip. The encoder
+    // is exercised by whatever HOME the harness runs under; this pins the SHAPE.
+    assert!(
+        !text.contains(' '),
+        "a raw space means the path was not encoded: {text:?}"
+    );
+}
+
+/// The control: no integration, no report. Without it the test above would pass on a
+/// terminal where something else -- a system rc, a theme -- happened to emit OSC 7, and
+/// prove nothing about our file.
+#[test]
+fn without_the_integration_no_working_directory_is_reported() {
+    use termisu_vt_host::termisu_host_next_event;
+
+    let host = spawn_zsh(false);
+    // Long enough for several prompt cycles; the positive case finds its event well
+    // inside this window.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        let mut polled = empty_frame();
+        assert_eq!(
+            unsafe { termisu_host_poll(host, &mut polled) },
+            TermisuHostResult::Success
+        );
+        let (mut kind, mut len) = (0u32, 0usize);
+        assert_eq!(
+            unsafe { termisu_host_next_event(host, &mut kind, ptr::null_mut(), 0, &mut len) },
+            TermisuHostResult::Success
+        );
+        if kind == 7 {
+            unsafe { termisu_host_free(host) };
+            panic!("an unintegrated zsh reported a working directory");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { termisu_host_free(host) };
+}

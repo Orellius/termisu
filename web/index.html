@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- No network, ever. The panel is a local document with an inlined bundle, so
+         even a compromised diff payload has nowhere to send anything. 'unsafe-inline'
+         is required because the bundle IS inline; there is no remote origin to
+         allow, which is the property that matters. Two widenings, both to bytes this
+         document already holds: `worker-src blob:` for Monaco's editor worker, built
+         from inlined source (measured in P0), and `font-src data:` for its inlined
+         codicon font, without which find and folding draw no icons (measured in P1).
+         The maintainer's calls, 2026-09-29. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; worker-src blob:; font-src data:; base-uri 'none'; form-action 'none'"
+    />
+    <title>Termisu panel</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

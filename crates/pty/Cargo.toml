@@ -1,0 +1,18 @@
+[package]
+name = "termisu-vt-pty"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The termisu-vt pty host: the one crate in the project that performs I/O."
+
+[dev-dependencies]
+termisu-vt-snapshot.workspace = true
+
+[dependencies]
+termisu-vt-core.workspace = true
+termisu-vt-frame.workspace = true
+thiserror.workspace = true
+rustix = { version = "1.1", features = ["pty", "termios", "process", "fs", "event"] }

@@ -1,0 +1,38 @@
+# Vendored fork of vte 0.15.0 (MIT/Apache-2.0, Joe Wilm & Christian Duerr; both
+# licenses kept alongside). ONE addition: a real ApcString state with
+# apc_start/apc_put/apc_end on Perform (default no-ops), because upstream lumps
+# SOS/PM/APC into one swallow-everything state and the kitty graphics protocol rides
+# APC. Diff deliberately minimal so upstream releases can be re-vendored by re-applying
+# it; if upstream ever grows APC dispatch, this fork retires (see README.md).
+#
+# ONE deletion, 2026-08-26: upstream's `src/ansi.rs` and the `#[cfg(feature = "ansi")]`
+# that gated it. The feature was never declared here, so rustc warned on an unexpected cfg
+# value and the module had never been compiled once. It cannot be: it needs `bitflags`,
+# `cursor-icon`, `log` and `serde`, none of which this crate depends on. Declaring the
+# feature would have pulled `cursor-icon` into the lock to serve a path nobody enables,
+# and `ansi.rs` is upstream's own VT interpretation, which is exactly the layer
+# `termisu-vt-core` exists to write. Re-vendoring is unaffected: the fork is re-applied
+# ONTO upstream, so a file absent downstream is simply a file we do not carry.
+[package]
+name = "termisu-vt-vte"
+version = "0.15.0"
+# The PACKAGE is renamed because `vte` on crates.io belongs to the upstream project this forks.
+# The LIB TARGET keeps the name `vte`, so every `use vte::...` in this workspace is untouched and
+# the fork stays a re-vendorable diff rather than a rewrite.
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Parser for implementing terminal emulators (termisu-vt APC fork)"
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "vte"
+path = "src/lib.rs"
+
+[dependencies]
+arrayvec = { version = "0.7.2", default-features = false }
+memchr = "2.7.4"
+
+[features]
+default = ["std"]
+std = ["arrayvec/std"]

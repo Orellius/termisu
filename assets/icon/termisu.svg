@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    Termisu - the app mark. The maintainer's direction, 2026-08-25: make the whole plate the dessert.
+    "שיראה כמו טרמיסו ויבלבל קצת אנשים" - it should read as a tiramisu first and as a terminal
+    a beat later, and the double take is the point.
+
+    THE LAYERS ARE THE ICON. There is no black plate any more: five bands fill the squircle
+    edge to edge, in the order a real slice has them - cocoa dust on top, then mascarpone and
+    soaked savoiardi alternating twice. The mark carries no separate background, so at 16px it
+    is still five stripes and still unmistakably this icon.
+
+    THE PROMPT IS DARK BROWN WITH A CREAM OUTLINE, and the outline is load-bearing rather than
+    decorative. A `>` and a caret in cocoa sit on FIVE different backgrounds depending on where
+    they cross, two of which (the cream bands) are close enough in value to the cocoa outline
+    that the shape would break apart mid-stroke. Drawing each shape twice - once wide in cream,
+    once narrow in cocoa - carves its own clearance whatever it crosses. The M2T mark that
+    stood here before this one used exactly this trick on its 2, for exactly this reason.
+
+    THE SILVER HAIRLINE IS UNCHANGED and stays a real stroke: full bleed, rx 224, #797979 at
+    width 10. `build-app.sh` asserts it at (0,64) of the 128px face and refuses a build without
+    it. It is painted LAST so the bands cannot bleed over it.
+
+    WHAT IS RULED OUT, carried forward because these are structural:
+
+    - LETTERS CENTRED ON A PLATE, in any weight or colour. Rejected as a pattern; there are no
+      letters here.
+    - NEGATIVE SPACE inside a shape does not survive a 16px downsample. Every shape is POSITIVE.
+    - AN UNDERSCORE instead of a block caret. It sits on the baseline, and against a banded
+      ground it reads as one more band. A block holds its own mass.
+
+    CENTRING IS COMPUTED, NOT EYEBALLED. The chevron's round caps add half a stroke beyond its
+    path at each end, so its drawn extent starts 48 left of x=301, not at 301. Centring on the
+    path numbers instead of the drawn extent leans the whole prompt left by half a stroke, which
+    is visible at 256px and is what the first cut of this file did.
+
+    RENDER WITH rsvg-convert, NOT WITH `magick` ALONE. ImageMagick falls back to its internal
+    MSVG renderer when librsvg is absent, and MSVG silently DROPS stroked paths: the icon comes
+    out with no prompt at all, no error, and a plausible-looking file. Measured 2026-08-25.
+    `brew install librsvg` puts the real renderer at /opt/homebrew/bin/rsvg-convert.
+
+    Regenerate the raster after any edit; nothing does it automatically. ONE file, because
+    `scripts/build-app.sh` builds the whole .iconset from it:
+      rsvg-convert -w 1024 -h 1024 assets/icon/termisu.svg -o assets/icon/termisu-1024.png
+    And judge at 32, which is what the Dock draws:
+      rsvg-convert -w 32 assets/icon/termisu.svg | magick - -filter point -resize 900% out.png
+  -->
+  <defs>
+    <!-- One clip for every band, so the squircle's corners cannot drift band to band. -->
+    <clipPath id="plate">
+      <rect x="7" y="7" width="1010" height="1010" rx="224" ry="224"/>
+    </clipPath>
+  </defs>
+
+  <!--
+    The slice, top to bottom. Cocoa dust, then cream and biscuit twice.
+
+    THE COCOA HAIRLINE at the foot of each cream band is the maintainer's note, 2026-08-25, and it is the
+    thing that makes this read as a dessert rather than as a striped rectangle. In a real slice
+    the cocoa dusted between layers settles on top of the soaked savoiardi, so the boundary
+    where mascarpone meets biscuit is a dark line and the boundary where biscuit meets the next
+    mascarpone is not. Drawing it on both would give a stack of outlined bars; drawing it on one
+    is what gives the layers an order and a direction.
+
+    It is 14px at 1024, which is 1.4% of the icon and just under half a pixel at 32. It does not
+    survive as a LINE at Dock size and is not meant to: what survives is a slight darkening at
+    that one edge, which is the same cue at a size that cannot hold the detail.
+  -->
+  <g clip-path="url(#plate)">
+    <rect x="0" y="0"   width="1024" height="232" fill="#4a2c1a"/>
+    <rect x="0" y="232" width="1024" height="198" fill="#f2e6c9"/>
+    <rect x="0" y="416" width="1024" height="14"  fill="#4a2c1a"/>
+    <rect x="0" y="430" width="1024" height="198" fill="#c89a5b"/>
+    <rect x="0" y="628" width="1024" height="198" fill="#f2e6c9"/>
+    <rect x="0" y="812" width="1024" height="14"  fill="#4a2c1a"/>
+    <rect x="0" y="826" width="1024" height="198" fill="#c89a5b"/>
+  </g>
+
+  <!-- The clearance pass: same geometry, cream, wider. See the card above. -->
+  <g fill="none" stroke="#f7efdc" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M301 380 L441 512 L301 644" stroke-width="152"/>
+    <path d="M591 616 L711 616" stroke-width="152"/>
+  </g>
+  <!-- The prompt itself. -->
+  <g fill="none" stroke="#3a2114" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M301 380 L441 512 L301 644" stroke-width="96"/>
+    <path d="M591 616 L711 616" stroke-width="96"/>
+  </g>
+
+  <!-- The hairline, painted LAST so no band can bleed over it. -->
+  <rect x="7" y="7" width="1010" height="1010" rx="224" ry="224"
+        fill="none" stroke="#797979" stroke-width="10"/>
+</svg>

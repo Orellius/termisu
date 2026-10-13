@@ -1,0 +1,185 @@
+name: Rust
+
+# What this can and cannot check, stated up front so a green tick is not read as more than it is.
+#
+# The full gate for this project is five suites, and three of them need hardware or a build that
+# a hosted runner does not have:
+#
+#   * the differential corpus links the REAL libghostty-vt, which means a Ghostty checkout and
+#     Zig 0.16.0 exactly. `crates/ghostty` and `crates/difftest` are the only crates that need
+#     it, and they are excluded here rather than faked.
+#   * `scripts/build-swift.sh` drives AppKit and WebKit in a real window across six smoke
+#     stages. (It replaced `smoke-termisu.sh`, which died with Tauri on 2026-08-11.)
+#   * the GPU backend needs a device wgpu will accept.
+#
+# So CI runs the part that is pure: the parser, the grid, the frame handoff, and the Unicode
+# bidi conformance suite. That last one is the crown jewel and it is fully portable, which is
+# the happy accident of keeping bidi out of the core.
+#
+# Everything else stays a local gate, and README says so.
+#
+# A job was removed here on 2026-08-14; the reasoning is kept below where it stood rather than
+# only in a commit message, because "why is there no Linux job" is a question somebody will ask
+# with a workflow file open and no git blame to hand.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # No `-D warnings`. The vendored vte fork emits an `unexpected cfg condition value` from
+  # upstream's own feature gating, and denying warnings globally would fail the build for
+  # somebody else's code and pressure us into patching a fork we want to keep re-vendorable.
+  # Measured before this file was committed, rather than discovered by a red first run.
+
+jobs:
+  core:
+    name: core logic (portable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component clippy
+          ./scripts/cargo.sh --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The bidi conformance suite reads the Unicode Character Database, which is vendored on
+      # demand rather than committed. `ucd.lock` pins the revision, so a conformance failure
+      # after a Unicode update is distinguishable from a regression somebody caused.
+      - name: Vendor the Unicode bidi suite
+        run: ./scripts/fetch-ucd.sh
+
+      # Named packages, never `--workspace`: the workspace pulls in the two crates that link
+      # libghostty-vt, and those cannot build here. A green tick on a build that silently
+      # skipped the oracle would be worse than no tick.
+      #
+      # The seqlock race test is skipped, and it is worth being precise about why, because it
+      # is NOT a weakened assertion. `the_reader_never_accepts_a_frame_the_writer_was_still_
+      # writing` demands `accepted > 0`: it refuses to report success unless a clean read
+      # actually happened. On a shared runner the writer holds the counter odd almost
+      # continuously, so every read is skipped and the invariant is never exercised, and the
+      # test correctly fails rather than passing vacuously. It needs genuine parallelism, so
+      # it stays a local gate. Its partner, `a_reader_that_ignores_the_counter_does_observe_
+      # torn_frames`, is the one that proves the invariant can fail, and it still runs here.
+      - name: Test the oracle-free crates
+        run: >
+          ./scripts/cargo.sh test
+          -p termisu-vt-core
+          -p termisu-vt-snapshot
+          -p termisu-vt-vte
+          -p termisu-vt-frame
+          -p termisu-markdown
+          -p termisu-cli
+          --
+          --skip the_reader_never_accepts_a_frame_the_writer_was_still_writing
+
+      - name: Clippy
+        run: >
+          ./scripts/cargo.sh clippy
+          -p termisu-vt-core
+          -p termisu-vt-snapshot
+          -p termisu-vt-frame
+          -p termisu-markdown
+          -p termisu-cli
+          --all-targets
+
+  # THE `linux-host` JOB WAS RETIRED 2026-08-14. Read this before adding it back.
+  #
+  # It guarded one property: the Tauri PRODUCT CRATE compiles off macOS. `block2` and `objc2`
+  # sat in its portable `[dependencies]` table until 2026-08-08, and nothing on a Mac can
+  # notice that, so the gate had to live on a runner that is not a Mac.
+  #
+  # Tauri was deleted on 2026-08-11 (PRs #45-#53) and `crates/termisu` went with it. Every one
+  # of the job's three steps then referenced something that no longer exists:
+  #
+  #   * it apt-installed webkit2gtk and friends for wry's build script - no wry.
+  #   * it ran `bun install --cwd chrome` - `chrome/` was deleted in the same change, and this
+  #     is the step that actually went red: "failed to change directory to chrome: ENOENT".
+  #   * it ran `cargo check -p termisu` - measured 2026-08-14: "error: package ID specification
+  #     `termisu` did not match any packages". It would have failed next.
+  #
+  # THE COST OF LEAVING IT: main was red on every single merge from PR #57 through #61, and
+  # five merges landed anyway. A permanently red gate is worse than a missing one, because it
+  # trains everyone to merge past red and then the next real failure lands in the same silence.
+  #
+  # NOTHING TRUE IS LOST BY REMOVING IT. Portability for the crates that actually claim it is
+  # already gated by the `core` job above, which runs core, snapshot, vte and frame on
+  # ubuntu-latest and passes. `render` and `pty` carry one macOS cfg each and `host` is the
+  # host library; no one has ever asserted those build on Linux, and post-Tauri nothing
+  # requires it - the host is Swift and macOS-only by definition.
+  #
+  # WHEN TO BRING IT BACK: the day Linux or Windows hosting becomes a real target. Point it at
+  # `render`, `pty` and `host` then, and expect it red on day one - that redness would be
+  # information, not a defect, and it must be treated as a blocker rather than merged past.
+
+  macos:
+    name: pty and renderer (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          ./scripts/cargo.sh --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Vendor the Unicode bidi suite
+        run: ./scripts/fetch-ucd.sh
+
+      # The pty crate is the only I/O in the project and its behaviour is genuinely
+      # platform-specific: Darwin refuses TIOCSWINSZ on the pty master and returns ENOTTY,
+      # while Linux accepts it. That divergence is exactly why this job is not merged into
+      # the portable one.
+      #
+      # esctest is skipped because it drives the esctest2 conformance suite, which is vendored
+      # on demand by scripts/fetch-esctest.sh and pinned in esctest.lock rather than committed.
+      # Its 391 pinned passes are pinned in BOTH directions, so a regression fails and an
+      # unpromoted pass also fails, which makes it a gate that has to run against a checkout
+      # somebody deliberately vendored. It stays local.
+      - name: Test the pty host
+        run: >
+          ./scripts/cargo.sh test -p termisu-vt-pty
+          --
+          --skip esctest_conformance_matches_the_pinned_expectations
+
+      # The renderer resolves fonts from the system, so it needs a macOS image. GPU-backed
+      # tests are excluded: a hosted runner has no device wgpu will accept, and a test that
+      # silently falls back to a software path is measuring something else.
+      - name: Build the renderer and its example
+        run: |
+          ./scripts/cargo.sh build -p termisu-vt-render
+          ./scripts/cargo.sh build -p termisu-vt-render --example screenshot
+
+  documentation:
+    name: docs and links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every image the README points at has to exist. A broken hero image on the front page
+      # is the first thing a visitor sees, and it has been broken once already by a file move.
+      - name: Every referenced image resolves
+        run: |
+          missing=0
+          for p in $(grep -ohE '(docs/images|assets)/[A-Za-z0-9._/-]+\.png' README.md | sort -u); do
+            if [ -f "$p" ]; then echo "ok      $p"; else echo "MISSING $p"; missing=1; fi
+          done
+          exit $missing
+
+      # A house style rule, checked mechanically because that is the only way a style rule
+      # survives contact with a hurry.
+      - name: No em dashes or en dashes
+        run: |
+          if grep -rlP '[\x{2014}\x{2013}]' --include='*.md' . ; then
+            echo "em dash or en dash found in the files above; use a plain hyphen"
+            exit 1
+          fi
+          echo "clean"

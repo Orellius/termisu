@@ -1,0 +1,2703 @@
+//! Purpose: the embedder C surface -- spawn a shell, poll rendered pixels, send bytes.
+//! Public surface: `termisu_host_spawn/poll/send/resize/free` and their C types, mirrored
+//!   one-to-one by `include/termisu_host.h`.
+//! Why this file: the GUI host (slice 8's Swift app) needs the pty -> core -> frame ->
+//!   renderer pipeline behind one C handle, and none of that belongs in the `ghostty_*`
+//!   mirror, which stays a pure VT readout. Depending on `termisu-vt-abi` as an rlib puts
+//!   both surfaces in one archive, because two Rust staticlibs cannot share a link.
+//! NOT responsible for: VT semantics (core), the handoff protocol (frame), I/O (pty),
+//!   rasterization (render). This crate only composes them and polices the boundary.
+//! Test strategy: `tests/host_abi.rs` drives the whole chain through the C surface and
+//!   byte-compares the pixels against a reference renderer fed the identical bytes through
+//!   the Rust API, using the same `Publisher` the pump uses -- plus the skip-a-row control
+//!   that proves the comparison can fail.
+
+// The rlib dependency is what carries the 13 `ghostty_*` exports into this staticlib.
+use termisu_vt as _;
+
+/// The agent registry: which CLIs a pane can launch, how each is spawned and what counts as a
+/// live one. Zero external dependencies - it was in the app crate because the app crate was the
+/// only caller, not because it needed anything from it.
+pub mod agent;
+/// Pane tiling over a rect, and the rect type itself. Imports NOTHING.
+pub mod layout;
+/// A tiled set of panes over one GPU context, built on `layout` and `session`.
+pub mod canvas;
+/// Spawning a pane and deciding whether what came up is actually running, built on `agent`.
+/// `dress` lives here: the ONE place a child's environment and working directory are set.
+pub mod launch;
+pub mod paths;
+/// Selection copy and bracketed paste, over a `session`.
+///
+/// Moved here from the Tauri crate on 2026-08-11 with `wheel` and `scrollback`, when the host
+/// went back to Swift. None of the three ever touched Tauri: this one speaks only to `Session`,
+/// `wheel` imports nothing at all, and `scrollback` imports one key module. They sat in the app
+/// crate for the accidental reason that the app crate was the only host. A Swift host reaches
+/// them through the C surface below, and a second implementation in Swift would be a second
+/// place for the chord table and the wheel accumulator to disagree with this one.
+pub mod clipboard;
+pub mod config;
+pub mod cwd;
+/// Mouse-reporting state and routing, shared by the C surface below and by `session`. One
+/// policy, two callers - see its module card.
+pub mod pointer;
+/// Scrollback chords and prompt jumps: which key means what distance.
+pub mod scrollback;
+/// Wheel accumulation and its escape hatch. Pure arithmetic, no dependencies whatsoever.
+pub mod wheel;
+/// The same pipeline as the C surface below, offered to Rust callers in this workspace.
+/// See its module card for why both exist and when they converge.
+pub mod select;
+pub mod strip;
+pub mod caret;
+pub mod lead;
+pub mod session;
+pub mod suggest;
+pub mod workflow;
+
+use std::ffi::{CStr, CString, c_char};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use config::Config;
+use termisu_vt_frame::{BaseDirection, Frame};
+use termisu_vt_pty::{Geometry, Host, Options};
+use termisu_vt_render::{FontStack, GpuSurface, Palette, Renderer, Surface};
+
+/// The font size used when `TermisuHostOptions.font_size` is 0 -- the same size every
+/// render-crate test measures with.
+pub const DEFAULT_FONT_SIZE: f32 = 16.0;
+
+/// Mirrors `TermisuHostResult` in `termisu_host.h`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermisuHostResult {
+    Success = 0,
+    InvalidValue = 1,
+    SpawnFailed = 2,
+    ResizeRefused = 3,
+    RenderFailed = 4,
+    SendFailed = 5,
+    /// The call was valid but the protocol produced nothing: mouse reporting is off,
+    /// the event deduplicated away, or wheel routing left the event to the embedder
+    /// (viewport scroll). Not an error -- the embedder's own handling is next.
+    Ignored = 6,
+    /// The argv carried a flag that turns an agent's approvals off. Nothing was spawned
+    /// and nothing was stripped: which flag, and where it sat, comes from
+    /// `termisu_agent_screen` on the same argv.
+    Refused = 7,
+}
+
+/// Mirrors `TermisuHostOptions` in `termisu_host.h`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TermisuHostOptions {
+    pub cols: u16,
+    pub rows: u16,
+    pub font_size: f32,
+    pub command: *const c_char,
+    pub auto_direction: bool,
+    /// Contributes ONLY the theme palette; NULL keeps the built-in scheme. The scalar
+    /// settings are read by the embedder through the `termisu_config_*` getters instead,
+    /// because the embedder owns their precedence (CLI flags, Retina scaling).
+    pub config: *const TermisuConfig,
+    /// Working directory for the child, or NULL for the default (home for an interactive
+    /// shell, the caller's cwd for an explicit command). A path that does not exist is
+    /// ignored, not an error. S5 workspaces set it to a worktree.
+    pub cwd: *const c_char,
+}
+
+/// The state behind the opaque config handle: one loaded `Config` plus the C strings
+/// its getters lend out.
+pub struct TermisuConfig {
+    config: Config,
+    shell: Option<CString>,
+    font_family: Option<CString>,
+    error: Option<CString>,
+}
+
+/// Mirrors `TermisuHostFrame` in `termisu_host.h`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TermisuHostFrame {
+    pub pixels: *const u8,
+    pub width: u32,
+    pub height: u32,
+    pub generation: u64,
+    pub drew: bool,
+    pub child_exited: bool,
+    /// The background the grid currently shows at its edge, RGBA -- resolved from the
+    /// top-left cell's style when the bottom-left cell agrees (a top row alone is a header,
+    /// not a theme), else the palette default, which is also the answer before any frame. A
+    /// GUI painting window margins with it makes the terminal read as continuing into
+    /// the frame, and it follows a program's own background (vim themes, BCE clears)
+    /// as well as any future palette theme. Never sampled from pixels: the corner
+    /// pixel belongs to the caret whenever the cursor sits at home.
+    pub background: [u8; 4],
+    /// One byte per grid row (`row_count` of them): the row's shell-semantic class per
+    /// OSC 133 -- `TERMISU_ROW_OUTPUT`, `TERMISU_ROW_PROMPT` or `TERMISU_ROW_INPUT`. This is
+    /// what a block gutter draws from (S2). Borrowed with the same lifetime as `pixels`:
+    /// valid until the next poll, resize, or free. NULL before the first drawn frame.
+    pub row_semantics: *const u8,
+    pub row_count: u32,
+    /// Rows the displayed view is scrolled up into history; 0 is the live bottom. Set by
+    /// the pump after clamping, so it reports where the view actually IS -- a GUI drawing
+    /// a scroll indicator reads this, never its own accumulated deltas.
+    pub viewport_offset: u32,
+    /// The caret's cell in this frame's coordinates, and whether it is shown. The
+    /// ghost-suggestion layer (S4) anchors here; the renderer already draws the caret
+    /// itself, so a GUI must never re-derive this from pixels.
+    pub cursor_col: u16,
+    pub cursor_row: u16,
+    pub cursor_visible: bool,
+}
+
+pub const TERMISU_ROW_OUTPUT: u8 = 0;
+pub const TERMISU_ROW_PROMPT: u8 = 1;
+pub const TERMISU_ROW_INPUT: u8 = 2;
+/// `termisu_host_row_text` filter value: every cell regardless of its OSC 133 mark.
+pub const TERMISU_TEXT_ALL: u8 = 255;
+
+/// The state behind the opaque handle: the whole pipeline, composed.
+pub struct TermisuHost {
+    host: Host,
+    reader: termisu_vt_frame::FrameReader,
+    renderer: Renderer<GpuSurface>,
+    frame: Frame,
+    /// Stable storage backing the borrowed `pixels` pointer handed across the boundary.
+    /// Replaced on every draw, which is exactly the documented lifetime: one poll.
+    ///
+    /// Left EMPTY while a window is attached: presenting reads the pixels on the GPU, so
+    /// filling this would reinstate the very 12.5 MB per frame readback the window exists to
+    /// avoid. `TermisuHostFrame::pixels` is then null and the embedder draws nothing itself.
+    pixels: Vec<u8>,
+    /// The GPU context every renderer for this host is built on. Held so a rebuild lands on
+    /// the same device an attached window's swapchain was created from.
+    gpu: termisu_vt_render::GpuContext,
+    /// The window this host presents into, when one has been attached. `None` keeps the
+    /// original CGImage path exactly as it was, which is what makes the swap reversible and
+    /// keeps the old path available as the oracle.
+    window: Option<termisu_vt_render::WindowTarget>,
+    drawn_generation: u64,
+    font_size: f32,
+    /// The configured lead font and ligature switch, kept because every renderer
+    /// rebuild (resize, zoom) must reproduce them.
+    font_family: Option<String>,
+    ligatures: bool,
+    /// The theme, kept because resize rebuilds the renderer -- a rebuild that forgot it
+    /// would silently revert to the built-in scheme (pinned by the host_abi resize test).
+    palette: Palette,
+    /// The kitty image store the pump maintains; placements in the frame point at it.
+    images: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<u32, (u32, u32, std::sync::Arc<Vec<u8>>)>>,
+    >,
+    /// Events not yet handed to the embedder; refilled from the pump's queue whenever
+    /// `termisu_host_next_event` finds it empty. One event per call, oldest first.
+    pending_events: std::collections::VecDeque<termisu_vt_core::events::Event>,
+    /// Stable storage backing the borrowed `row_semantics` pointer, one byte per row.
+    /// Rebuilt on every draw, same lifetime contract as `pixels`.
+    row_semantics: Vec<u8>,
+    /// Mouse-reporting state the embedder cannot carry itself: view geometry (set via
+    /// `termisu_host_mouse_geometry`), which buttons are down, and the motion-dedup cell.
+    /// The type is shared with `session` so both surfaces route a pointer identically.
+    mouse: crate::pointer::Pointer,
+    /// The blurred history rows above the viewport, for the strip behind the tab band.
+    strip: crate::strip::Strip,
+    /// The caret as a one-cell image, for a GUI that draws it on its own layer.
+    caret: crate::caret::Caret,
+    /// The sharp history rows above the viewport, for pixel scrolling.
+    lead: crate::lead::Lead,
+    /// Whether the grid paints its own caret; kept because a rebuild must reproduce it.
+    caret_painted: bool,
+    exited: bool,
+}
+
+/// One row's shell-semantic class, derived from the per-cell OSC 133 marks the core
+/// tracks. Prompt wins over input: the row a prompt starts on usually also holds the
+/// typed command, and the gutter wants block STARTS.
+fn row_semantic(frame: &Frame, y: u16) -> u8 {
+    let mut class = TERMISU_ROW_OUTPUT;
+    for x in 0..frame.cols {
+        match frame.cell(x, y).semantic() {
+            termisu_vt_snapshot::Semantic::Prompt => return TERMISU_ROW_PROMPT,
+            termisu_vt_snapshot::Semantic::Input => class = TERMISU_ROW_INPUT,
+            termisu_vt_snapshot::Semantic::Output => {}
+        }
+    }
+    class
+}
+
+/// How a poll paints. `SkipRow` is the harness's broken renderer, never the real path.
+enum DrawMode {
+    Full,
+    SkipRow(u16),
+}
+
+fn build_renderer(
+    context: &termisu_vt_render::GpuContext,
+    font_size: f32,
+    cols: u16,
+    rows: u16,
+    family: Option<&str>,
+    ligatures: bool,
+) -> Option<Renderer<GpuSurface>> {
+    let fonts = FontStack::with_primary(family, font_size).ok()?;
+    let cell = fonts.metrics();
+    let context = context.clone();
+    // Every rebuild lands on the SAME device. Building through `Renderer::with_surface`
+    // would construct a fresh `GpuSurface`, and a fresh `GpuSurface` brings a whole new
+    // instance, adapter, device and queue with it -- so a resize moved the renderer onto a
+    // different device while the window's swapchain stayed on the old one. Nothing errored;
+    // the frame simply stopped following the window (seen live 2026-08-04).
+    //
+    // The catch_unwind stays: surface construction can still fail on a machine with no
+    // usable adapter, and across the C boundary that must be a reported failure rather than
+    // an unwind into foreign frames.
+    catch_unwind(AssertUnwindSafe(move || {
+        let surface = GpuSurface::with_context(
+            context,
+            cell.width * u32::from(cols),
+            cell.height * u32::from(rows),
+        )
+        .ok()?;
+        let mut renderer = Renderer::<GpuSurface>::from_surface(fonts, surface, cols, rows);
+        renderer.set_ligatures(ligatures);
+        Some(renderer)
+    }))
+    .ok()
+    .flatten()
+}
+
+fn poll_impl(host: &mut TermisuHost, mode: DrawMode) -> TermisuHostFrame {
+    host.reader.read_into(&mut host.frame);
+
+    let mut drew = false;
+    if host.frame.is_valid() && host.frame.generation > host.drawn_generation {
+        // A placement UNDER the text has to be blitted between the backgrounds and the
+        // glyphs, which the damage-driven row path cannot express -- so such a frame takes
+        // the layered path and repaints wholly. Checked before the ordinary draw so the
+        // grid is not painted twice. Everything else, including every image drawn ON TOP,
+        // keeps the incremental path it has always had.
+        let layered = host.frame.placements.iter().any(|p| p.z < 0)
+            && !matches!(mode, DrawMode::SkipRow(_));
+        if layered {
+            let resolved: Vec<_> = {
+                let store = host.images.lock().expect("image store");
+                host.frame
+                    .placements
+                    .iter()
+                    .map(|placement| store.get(&placement.image).cloned())
+                    .collect()
+            };
+            let placements = host.frame.placements.clone();
+            host.renderer
+                .draw_layered(&host.frame, &placements, &resolved);
+        } else {
+            match mode {
+            // The very first paint covers every row: rows the child never touched carry no
+            // damage stamp, and only `draw_all` gives them their background.
+            DrawMode::Full if host.drawn_generation == 0 => {
+                host.renderer.draw_all(&host.frame);
+            }
+            DrawMode::Full => {
+                host.renderer.draw(&host.frame);
+            }
+            DrawMode::SkipRow(skip) => {
+                host.renderer.draw_skipping_for_testing(&host.frame, skip);
+            }
+        }
+        // Kitty placements blit over the drawn grid; the store lock is held only for
+        // the Arc clones, never across the blend.
+        if !host.frame.placements.is_empty() {
+            let resolved: Vec<_> = {
+                let store = host.images.lock().expect("image store");
+                host.frame
+                    .placements
+                    .iter()
+                    .map(|placement| store.get(&placement.image).cloned())
+                    .collect()
+            };
+            let placements = host.frame.placements.clone();
+            let mut cursor = resolved.into_iter();
+            host.renderer
+                .draw_images(&placements, move |_| cursor.next().flatten());
+            }
+        }
+        // Unicode placeholders are re-resolved every polled frame rather than tracked:
+        // they live in the grid, so any row repaint erases the picture on that row and it
+        // has to go back on top. The scan costs a pass over the cells only when the child
+        // has actually printed placeholder cells; `virtual_runs` bails on the first cell
+        // of every ordinary row.
+        if !host.frame.virtuals.is_empty() {
+            let store = host.images.lock().expect("image store");
+            let images: std::collections::HashMap<u32, (u32, u32, std::sync::Arc<Vec<u8>>)> =
+                host.frame
+                    .virtuals
+                    .iter()
+                    .filter_map(|v| store.get(&v.image).cloned().map(|found| (v.image, found)))
+                    .collect();
+            drop(store);
+            host.renderer
+                .draw_placeholders(&host.frame, |id| images.get(&id).cloned());
+        }
+        host.drawn_generation = host.frame.generation;
+        // The readback exists only for embedders that draw the bytes themselves. With a window
+        // attached the frame goes to the screen on the GPU, and copying it back would cost a
+        // full frame across the bus every poll for nothing.
+        host.pixels = if host.window.is_some() {
+            Vec::new()
+        } else {
+            host.renderer.pixels()
+        };
+        // Rebuilt with the pixels so the two borrowed views always describe one frame.
+        host.row_semantics.clear();
+        host.row_semantics
+            .extend((0..host.frame.rows).map(|y| row_semantic(&host.frame, y)));
+        drew = true;
+    }
+
+    if !host.exited && matches!(host.host.try_wait(), Ok(Some(_))) {
+        host.exited = true;
+    }
+
+    TermisuHostFrame {
+        pixels: if host.pixels.is_empty() {
+            std::ptr::null()
+        } else {
+            host.pixels.as_ptr()
+        },
+        width: host.renderer.canvas().width(),
+        height: host.renderer.canvas().height(),
+        generation: host.drawn_generation,
+        drew,
+        child_exited: host.exited,
+        background: {
+            // The background the GRID currently shows at its edge, so a margin painted
+            // with it reads as the terminal continuing (Ghostty's `extend`). Resolved
+            // from the top-left cell's STYLE -- pixels there belong to the caret
+            // whenever the cursor sits at home, but the style is the cell's own.
+            //
+            // Only when the BOTTOM-left cell agrees. A colour on the top row alone is a
+            // header, not a theme: Claude Code pins the user's prompt as a grey bar on row 0
+            // while its transcript scrolls, and reading the corner alone turned the title
+            // band and every margin grey (the maintainer, 2026-10-02). A vim theme or a BCE clear
+            // paints both corners, and still extends.
+            let palette = host.renderer.palette();
+            if host.frame.is_valid() && host.frame.rows > 0 {
+                let edge = |row: u16| {
+                    palette.draw(&host.frame.style(host.frame.cell(0, row).style_id())).background
+                };
+                let top = edge(0);
+                if top == edge(host.frame.rows - 1) { top } else { palette.default_background }
+            } else {
+                palette.default_background
+            }
+        },
+        row_semantics: if host.row_semantics.is_empty() {
+            std::ptr::null()
+        } else {
+            host.row_semantics.as_ptr()
+        },
+        row_count: host.row_semantics.len() as u32,
+        viewport_offset: host.frame.viewport,
+        cursor_col: host.frame.cursor.x,
+        cursor_row: host.frame.cursor.y,
+        cursor_visible: host.frame.cursor.visible,
+    }
+}
+
+/// Builds the child command from the options: the configured command via `/bin/sh -c`,
+/// or an interactive login shell. TERM is declared by the host (a Finder launch
+/// inherits none) and the Claude Code child-session markers are scrubbed -- a terminal
+/// window is a session boundary (seen live 2026-07-29). Returns None on a non-UTF-8
+/// command string.
+fn build_command(options: &TermisuHostOptions) -> Option<Command> {
+    let explicit = !options.command.is_null();
+    let mut command = if !explicit {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let mut command = Command::new(shell);
+        command.arg("-il");
+        command
+    } else {
+        let text = unsafe { CStr::from_ptr(options.command) }.to_str().ok()?;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", text]);
+        command
+    };
+    // THE ONE PLACE, and this path was not using it. It hand-rolled `TERM` and the two
+    // session-marker removals, which is three of the four things `dress` does -- so it
+    // looked complete and MISSED `COLORTERM`. Every ordinary pane goes through here, so
+    // every child in every window was told the terminal had no truecolor.
+    //
+    // Measured 2026-08-26 from the live app: `claude` drew its mascot at 256-colour index
+    // 174, `#D78787`, a dusty pink, because `supports-color` reads `COLORTERM` and found
+    // none. The renderer was never at fault, and that was measured the same hour --
+    // `38;2;217;119;87` came back byte-exact, and so did every 256-colour index.
+    //
+    // This is the FOURTH divergence of the exact defect `dress` was written to end, and the
+    // first one on the main path. `tests/child_env.rs` could not see it: it asserts what a
+    // `Command` carries, and this function never handed it one.
+    launch::dress(&mut command);
+    // An explicit command keeps the PROCESS's directory rather than the home default that
+    // `dress` applies. `--command` is a probe, not a terminal window, and the smokes read a
+    // relative path back off the grid.
+    if explicit
+        && let Ok(here) = std::env::current_dir()
+    {
+        launch::seat(&mut command, &here);
+    }
+    apply_cwd(&mut command, options);
+    Some(command)
+}
+
+/// Applies `options.cwd`, which outranks whatever default the command already carries.
+///
+/// Shared by both spawn paths, and extracted rather than copied for the reason the whole
+/// `launch::dress` card gives: this rule was applied on one spawn path and absent on three
+/// others once already, and the symptom was a pane opening on the sealed read-only root.
+fn apply_cwd(command: &mut Command, options: &TermisuHostOptions) {
+    // An explicit working directory outranks both defaults above (S5 workspaces: a
+    // session belongs to a worktree). Set LAST so it wins over the home default without
+    // that branch having to know this option exists.
+    //
+    // BOUNDARY, found in the S5 live tap: this places the child's STARTING directory,
+    // and a configured command is free to walk away from it. `command = "cd X && exec
+    // zsh"` lands in X regardless of `cwd`, because the cd runs after the exec. That is
+    // correct precedence (an explicit command outranks a default), but it means a
+    // workspace looks broken for anyone whose config.toml shell line contains a cd.
+    //
+    // A directory that does not exist is IGNORED rather than fatal. `Command::spawn`
+    // reports a bad cwd as a plain ENOENT from the exec, indistinguishable from a missing
+    // shell, and a workspace whose directory was deleted under us should open somewhere
+    // usable rather than fail with a misleading error.
+    if !options.cwd.is_null() {
+        if let Ok(text) = unsafe { CStr::from_ptr(options.cwd) }.to_str() {
+            if !text.is_empty() && std::path::Path::new(text).is_dir() {
+                // `seat`, never a bare `current_dir`: the port block is derived from where
+                // the child sits, and this is the path a WORKSPACE takes. A worktree that
+                // moved here without it would carry the home block, which is the one block
+                // every other pane already has.
+                launch::seat(command, std::path::Path::new(text));
+            }
+        }
+    }
+}
+
+/// Spawns the command on a fresh pty and starts the parse/publish pipeline.
+///
+/// # Safety
+/// `options` and `out` must be non-NULL and valid for the duration of the call;
+/// `options.command` must be NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_spawn(
+    options: *const TermisuHostOptions,
+    out: *mut *mut TermisuHost,
+) -> TermisuHostResult {
+    if options.is_null() || out.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    // The failure contract: the out-param never dangles.
+    unsafe { out.write(std::ptr::null_mut()) };
+    let options = unsafe { options.read() };
+    unsafe { spawn_into(&options, || build_command(&options), out) }
+}
+
+/// Everything both spawn entry points do once a `Command` exists: build the renderer, open
+/// the pty, start the pump, and hand back one handle.
+///
+/// EXTRACTED 2026-08-11 for `termisu_host_spawn_agent`. An agent pane is the same pipeline
+/// with a different child, and the alternative -- a second copy of the retry loop, the
+/// palette precedence and the handle construction -- is the shape that has already cost this
+/// project the font-family bug and the cwd bug twice each: a rule applied on one spawn path
+/// and silently absent on the other.
+///
+/// `build` is called once PER ATTEMPT, not once: `Host::spawn` consumes the `Command` and the
+/// EAGAIN retry below needs a fresh one. `None` means the caller's command was malformed.
+///
+/// # Safety
+/// `out` must be non-NULL and valid for the duration of the call, and the caller must already
+/// have written NULL to it -- that is the never-dangle contract, and it belongs to the caller
+/// because only the caller knows what it validated before getting here.
+unsafe fn spawn_into(
+    options: &TermisuHostOptions,
+    mut build: impl FnMut() -> Option<Command>,
+    out: *mut *mut TermisuHost,
+) -> TermisuHostResult {
+    if options.cols == 0 || options.rows == 0 {
+        return TermisuHostResult::InvalidValue;
+    }
+
+    let Some(mut command) = build() else {
+        return TermisuHostResult::InvalidValue;
+    };
+
+    let font_size = if options.font_size > 0.0 {
+        options.font_size
+    } else {
+        DEFAULT_FONT_SIZE
+    };
+    // The theme rides the config handle; NULL keeps the built-in scheme. Cloned out
+    // because the handle's lifetime is the caller's -- freeing it after spawn is legal.
+    let (palette, font_family, ligatures, reports) = if options.config.is_null() {
+        // No config handle means no grant. Screen-inspection replies stay OFF for an
+        // embedder that never opted in, which is the safe direction to be wrong in.
+        (Palette::default(), None, true, false)
+    } else {
+        let config = &unsafe { &*options.config }.config;
+        (
+            config.palette.clone(),
+            config.font_family.clone(),
+            config.font_ligatures,
+            config.reports,
+        )
+    };
+
+    // One GPU context for this host's whole life. Every later rebuild - resize, zoom, font
+    // change - is constructed on it, which is what keeps a window's swapchain valid across
+    // rebuilds instead of orphaning it on a dead device.
+    let Ok(gpu) = termisu_vt_render::GpuContext::new() else {
+        return TermisuHostResult::RenderFailed;
+    };
+
+    // The renderer is built before the child so a machine that cannot render never spawns
+    // a process it would immediately have to reap.
+    let Some(mut renderer) = build_renderer(
+        &gpu,
+        font_size,
+        options.cols,
+        options.rows,
+        font_family.as_deref(),
+        ligatures,
+    ) else {
+        return TermisuHostResult::RenderFailed;
+    };
+    renderer.set_palette(palette.clone());
+
+    // fork/openpt can transiently EAGAIN when the machine is busy (measured under the
+    // parallel test load, 2026-07-30: one spawn in a full run failed and passed alone).
+    // A terminal window should survive that moment; genuine failures -- bad shell, no
+    // pty -- fail identically on every attempt and still surface, 50ms later.
+    let mut attempt = 0;
+    let (host, reader) = loop {
+        match Host::spawn(command, {
+            // Screen-inspection replies are an EMBEDDER grant, off unless the
+            // operator's config.toml says otherwise -- a program cannot ask for
+            // them and RIS cannot revoke them.
+            let mut spawn_options = Options::new(options.cols, options.rows);
+            spawn_options.reports = reports;
+            spawn_options
+        }) {
+            Ok(spawned) => break spawned,
+            Err(_) if attempt < 2 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                command = match build() {
+                    Some(rebuilt) => rebuilt,
+                    None => return TermisuHostResult::InvalidValue,
+                };
+            }
+            Err(_) => return TermisuHostResult::SpawnFailed,
+        }
+    };
+
+    // Base direction is a reader-side layout preference on the host's own Frame -- the
+    // publish channel never carries it and `read_into`/`resize` never write it, so setting
+    // it once here holds for the handle's lifetime. Auto flips a row's flow only when the
+    // row's own text resolves RTL; column-addressed TUI output stays where it was drawn.
+    let mut frame = Frame::new();
+    if options.auto_direction {
+        frame.base_direction = BaseDirection::Auto;
+    }
+
+    let images = host.image_store();
+    let handle = Box::new(TermisuHost {
+        host,
+        reader,
+        renderer,
+        frame,
+        pixels: Vec::new(),
+        gpu,
+        window: None,
+        drawn_generation: 0,
+        font_size,
+        font_family,
+        ligatures,
+        palette,
+        row_semantics: Vec::new(),
+        images,
+        pending_events: std::collections::VecDeque::new(),
+        mouse: crate::pointer::Pointer::default(),
+        strip: crate::strip::Strip::new(),
+        caret: crate::caret::Caret::new(),
+        lead: crate::lead::Lead::new(),
+        caret_painted: true,
+        exited: false,
+    });
+    unsafe { out.write(Box::into_raw(handle)) };
+    TermisuHostResult::Success
+}
+
+/// Reads the latest published frame and, if it is new, draws it.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`; `out` must be non-NULL and valid
+/// for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_poll(
+    host: *mut TermisuHost,
+    out: *mut TermisuHostFrame,
+) -> TermisuHostResult {
+    if host.is_null() || out.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let frame = poll_impl(unsafe { &mut *host }, DrawMode::Full);
+    unsafe { out.write(frame) };
+    TermisuHostResult::Success
+}
+
+/// Attaches a `CAMetalLayer` so polled frames are presented on the GPU instead of copied back.
+///
+/// Sizes are PHYSICAL pixels, not points. Passing point sizes on a Retina display configures a
+/// half-resolution swapchain, and the result looks soft rather than broken - the kind of wrong
+/// that ships.
+///
+/// Attaching stops `TermisuHostFrame::pixels` being filled: with a window the frame reaches the
+/// screen without ever crossing to the CPU, which is the whole point. An embedder that still
+/// wants the bytes must detach first.
+///
+/// Refuses rather than degrades: an adapter that cannot drive this window, or a window that
+/// offers no usable format, returns `RenderFailed` instead of a silently blank surface.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`. `layer` must be a live `CAMetalLayer`
+/// that outlives the host or is removed with `termisu_host_detach_layer` first.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_attach_layer(
+    host: *mut TermisuHost,
+    layer: *mut std::ffi::c_void,
+    width: u32,
+    height: u32,
+) -> TermisuHostResult {
+    if host.is_null() || layer.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    let context = host.renderer.surface_mut().context().clone();
+    match unsafe {
+        termisu_vt_render::WindowTarget::from_metal_layer(&context, layer, width, height)
+    } {
+        Ok(window) => {
+            host.window = Some(window);
+            // The next poll must repaint: the window has nothing in it yet, and the frame the
+            // embedder already drew lives in a CGImage we are about to stop producing.
+            host.drawn_generation = 0;
+            TermisuHostResult::Success
+        }
+        Err(_) => TermisuHostResult::RenderFailed,
+    }
+}
+
+/// Drops the window, restoring the readback path on the next poll.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_detach_layer(host: *mut TermisuHost) -> TermisuHostResult {
+    if host.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    host.window = None;
+    host.drawn_generation = 0;
+    TermisuHostResult::Success
+}
+
+/// Reconfigures the swapchain after the layer's drawable size changed. PHYSICAL pixels.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_resize_layer(
+    host: *mut TermisuHost,
+    width: u32,
+    height: u32,
+) -> TermisuHostResult {
+    if host.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    match host.window.as_mut() {
+        Some(window) => {
+            window.resize(width, height);
+            TermisuHostResult::Success
+        }
+        None => TermisuHostResult::InvalidValue,
+    }
+}
+
+/// Draws the current frame into the attached window and presents it.
+///
+/// Separate from `termisu_host_poll` on purpose: polling advances the terminal, presenting puts
+/// a frame on screen, and an embedder drives them at different rates - a resize presents
+/// without polling, and a quiet terminal polls without needing to present.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_present(host: *mut TermisuHost) -> TermisuHostResult {
+    if host.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    if host.window.is_none() {
+        return TermisuHostResult::InvalidValue;
+    }
+    // The margin colour, resolved exactly the way the polled frame reports it: from the
+    // top-left cell's STYLE, falling back to the palette default. A grid rounds to whole
+    // cells, so the window is almost never an exact multiple of the surface and the
+    // remainder is visible - clearing it to black while the terminal renders on 0x0d0d0d
+    // draws a hard band down the edge.
+    let clear = {
+        let palette = host.renderer.palette();
+        if host.frame.is_valid() {
+            let style = host.frame.style(host.frame.cell(0, 0).style_id());
+            palette.draw(&style).background
+        } else {
+            palette.default_background
+        }
+    };
+    let window = host.window.as_mut().expect("checked above");
+    match window.present(host.renderer.surface_mut(), clear) {
+        Ok(()) => TermisuHostResult::Success,
+        Err(_) => TermisuHostResult::RenderFailed,
+    }
+}
+
+/// The same as `termisu_host_poll`, but every draw silently declines one row.
+///
+/// This is a broken host on purpose: `tests/host_abi.rs` byte-compares polled pixels
+/// against a reference, and a comparison that has never been seen to fail is not evidence.
+/// Not part of the C surface, and it has no legitimate caller.
+///
+/// # Safety
+/// Same contract as `termisu_host_poll`.
+#[doc(hidden)]
+pub unsafe fn termisu_host_poll_skipping_row_for_testing(
+    host: *mut TermisuHost,
+    skip: u16,
+    out: *mut TermisuHostFrame,
+) -> TermisuHostResult {
+    if host.is_null() || out.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let frame = poll_impl(unsafe { &mut *host }, DrawMode::SkipRow(skip));
+    unsafe { out.write(frame) };
+    TermisuHostResult::Success
+}
+
+/// Writes bytes to the child's input -- the `Host::send` seam.
+///
+/// # Safety
+/// `host` must be a live handle; `bytes` must point to `len` readable bytes, or be NULL
+/// when `len` is 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_send(
+    host: *mut TermisuHost,
+    bytes: *const u8,
+    len: usize,
+) -> TermisuHostResult {
+    if host.is_null() || (bytes.is_null() && len != 0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    let bytes = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, len) }
+    };
+    match host.host.send(bytes) {
+        Ok(()) => TermisuHostResult::Success,
+        Err(_) => TermisuHostResult::SendFailed,
+    }
+}
+
+/// Encodes clipboard bytes for the child and writes them to the pty.
+///
+/// The transform is the oracle-measured paste encoding (`termisu_vt_pty::paste`): xterm's
+/// strip set becomes spaces always, then the data is wrapped in `ESC[200~`/`ESC[201~`
+/// when the child has bracketed paste (mode 2004) on, or has its newlines folded to
+/// carriage returns when it does not. Callers pass raw clipboard bytes and never build
+/// either form themselves.
+///
+/// The mode rides the last polled frame -- the pump thread owns the terminal, so the
+/// frame is how its state crosses to this thread. A host must therefore have polled
+/// since the child enabled the mode; any host that renders does so continuously.
+///
+/// # Safety
+/// `host` must be a live handle; `bytes` must point to `len` readable bytes, or be NULL
+/// when `len` is 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_paste(
+    host: *mut TermisuHost,
+    bytes: *const u8,
+    len: usize,
+) -> TermisuHostResult {
+    if host.is_null() || (bytes.is_null() && len != 0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    let bytes = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, len) }
+    };
+    let encoded = termisu_vt_pty::paste::encode(bytes, host.frame.bracketed_paste());
+    match host.host.send(&encoded) {
+        Ok(()) => TermisuHostResult::Success,
+        Err(_) => TermisuHostResult::SendFailed,
+    }
+}
+
+/// The state behind the opaque history handle: the store plus the path appends
+/// persist to.
+pub struct TermisuHistory {
+    history: suggest::History,
+    path: PathBuf,
+}
+
+/// Opens (or starts) the command history at `path`, or `~/.ruuah/history` when NULL.
+///
+/// # Safety
+/// `path`, if non-NULL, must be NUL-terminated; `out` must be valid for one write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_history_load(
+    path: *const c_char,
+    out: *mut *mut TermisuHistory,
+) -> TermisuHostResult {
+    if out.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let path = if path.is_null() {
+        let Some(home) = std::env::var_os("HOME") else {
+            unsafe { out.write(std::ptr::null_mut()) };
+            return TermisuHostResult::InvalidValue;
+        };
+        Path::new(&home).join(".ruuah").join("history")
+    } else {
+        match unsafe { CStr::from_ptr(path) }.to_str() {
+            Ok(path) => Path::new(path).to_path_buf(),
+            Err(_) => {
+                unsafe { out.write(std::ptr::null_mut()) };
+                return TermisuHostResult::InvalidValue;
+            }
+        }
+    };
+    let handle =
+        Box::new(TermisuHistory { history: suggest::History::load(&path), path });
+    unsafe { out.write(Box::into_raw(handle)) };
+    TermisuHostResult::Success
+}
+
+/// # Safety
+/// `handle` must be NULL or a live handle from `termisu_history_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_history_free(handle: *mut TermisuHistory) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+/// Records one executed command and persists the store. Blank, multiline, and
+/// consecutive-duplicate commands are dropped by the store's own rules; a failed
+/// save answers SendFailed but keeps the in-memory entry (suggestions still work
+/// this session).
+///
+/// `cwd` is the RAW OSC 7 report (event kind 7), or NULL. It is normalized here rather
+/// than by the caller: the core stores what the child sent, undecoded, so exactly one
+/// place should know how to turn `file:///My%20Code` into a directory.
+///
+/// # Safety
+/// `handle` live; `command` readable for `len` bytes; `cwd` readable for `cwd_len`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_history_append(
+    handle: *mut TermisuHistory,
+    command: *const u8,
+    len: usize,
+    cwd: *const u8,
+    cwd_len: usize,
+) -> TermisuHostResult {
+    if handle.is_null() || (command.is_null() && len != 0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    let cwd = unsafe { normalized_cwd(cwd, cwd_len) };
+    let handle = unsafe { &mut *handle };
+    let bytes = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(command, len) }
+    };
+    let Ok(command) = std::str::from_utf8(bytes) else {
+        return TermisuHostResult::InvalidValue;
+    };
+    let before = handle.history.len();
+    handle.history.append(command, cwd.as_deref());
+    if handle.history.len() == before {
+        return TermisuHostResult::Ignored;
+    }
+    match handle.history.save(&handle.path) {
+        Ok(()) => TermisuHostResult::Success,
+        Err(_) => TermisuHostResult::SendFailed,
+    }
+}
+
+/// The most recent history entry `input` is a proper prefix of, via the buffer
+/// protocol; `Ignored` with length 0 when nothing matches.
+///
+/// `cwd` is the RAW OSC 7 report, or NULL. A match made in that directory is preferred;
+/// with no match there, or no directory at all, the newest match anywhere wins.
+///
+/// # Safety
+/// `handle` live; `input` readable for `len` bytes; `cwd` readable for `cwd_len`;
+/// `out`/`out_len` per the protocol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_history_suggest(
+    handle: *const TermisuHistory,
+    input: *const u8,
+    len: usize,
+    cwd: *const u8,
+    cwd_len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> TermisuHostResult {
+    if handle.is_null() || (input.is_null() && len != 0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    let cwd = unsafe { normalized_cwd(cwd, cwd_len) };
+    let bytes = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(input, len) }
+    };
+    let Ok(input) = std::str::from_utf8(bytes) else {
+        return TermisuHostResult::InvalidValue;
+    };
+    match unsafe { &*handle }.history.suggest(input, cwd.as_deref()) {
+        Some(suggestion) => copy_out(suggestion, out, cap, out_len),
+        None => {
+            if !out_len.is_null() {
+                unsafe { out_len.write(0) };
+            }
+            TermisuHostResult::Ignored
+        }
+    }
+}
+
+/// The filesystem path a raw OSC 7 report names, written into `out`.
+///
+/// The same normalizer the history calls use, exposed because the embedder needs the
+/// decoded path for its own purposes (S6 runs git in it) and the repo's rule is that
+/// exactly ONE place knows how to undo percent-escapes. A second decoder in Swift would
+/// be a second implementation of a fiddly transform, in another language, with nothing
+/// comparing the two -- which is precisely how the emitter/decoder pair drifted before.
+///
+/// `Ignored` (with `*out_len` set to 0) when the report names no directory, so "not a
+/// path" is distinguishable from "buffer too small". Call with `out` NULL to size.
+///
+/// # Safety
+/// `raw` readable for `len` bytes or NULL when `len` is 0; `out` writable for `cap`
+/// bytes or NULL; `out_len` writable or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_cwd_path(
+    raw: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> TermisuHostResult {
+    match unsafe { normalized_cwd(raw, len) } {
+        Some(path) => copy_out(&path, out, cap, out_len),
+        None => {
+            if !out_len.is_null() {
+                unsafe { out_len.write(0) };
+            }
+            TermisuHostResult::Ignored
+        }
+    }
+}
+
+/// A raw OSC 7 report as a directory key, or `None` for NULL, empty, or unusable input.
+///
+/// # Safety
+/// `raw` readable for `len` bytes, or NULL when `len` is 0.
+unsafe fn normalized_cwd(raw: *const u8, len: usize) -> Option<String> {
+    if raw.is_null() || len == 0 {
+        return None;
+    }
+    crate::cwd::normalize(unsafe { std::slice::from_raw_parts(raw, len) })
+}
+
+fn mouse_mods(mods: u32) -> termisu_vt_pty::mouse::Mods {
+    termisu_vt_pty::mouse::Mods {
+        shift: mods & 1 != 0,
+        ctrl: mods & 2 != 0,
+        alt: mods & 4 != 0,
+    }
+}
+
+/// Sets the view geometry mouse encoding converts through: the surface size in pixels
+/// and the content insets around the grid, both in the same backing-pixel space the
+/// frame's pixels use. Call after layout changes (resize, zoom, inset change); until
+/// the first call, pointer events answer `Ignored`.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_mouse_geometry(
+    host: *mut TermisuHost,
+    screen_width: u32,
+    screen_height: u32,
+    padding_left: u32,
+    padding_top: u32,
+    padding_right: u32,
+    padding_bottom: u32,
+) -> TermisuHostResult {
+    if host.is_null() || screen_width == 0 || screen_height == 0 {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    host.mouse.set_geometry(
+        screen_width,
+        screen_height,
+        padding_left,
+        padding_top,
+        padding_right,
+        padding_bottom,
+    );
+    TermisuHostResult::Success
+}
+
+/// Feeds one pointer event to the mouse-reporting protocol.
+///
+/// `action`: 0 press, 1 release, 2 motion. `button`: 0 none (motion with nothing
+/// held), 1 left, 2 middle, 3 right, 4..9 the protocol's wheel/aux buttons. `mods`:
+/// bit 0 shift, bit 1 ctrl, bit 2 alt. `x`/`y`: surface pixels from the view's
+/// top-left, the same space `termisu_host_mouse_geometry` described.
+///
+/// Returns `Success` when a report was encoded and written to the pty, `Ignored` when
+/// the protocol produced nothing -- reporting off, motion deduplicated, position
+/// outside the viewport with nothing held, or a button the protocol cannot name. On
+/// `Ignored` the event is the embedder's again (selection, context menus). Button
+/// bookkeeping happens on every call either way, so press/release pairs must reach
+/// this function even while reporting is off.
+///
+/// The active modes ride the last polled frame, like `termisu_host_paste`.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_mouse(
+    host: *mut TermisuHost,
+    action: u32,
+    button: u32,
+    mods: u32,
+    x: f32,
+    y: f32,
+) -> TermisuHostResult {
+    if host.is_null() || action > 2 {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+
+    use termisu_vt_pty::mouse::Action;
+    let action = match action {
+        0 => Action::Press,
+        1 => Action::Release,
+        _ => Action::Motion,
+    };
+
+    // The policy - held-button bookkeeping, geometry, dedup - lives in `pointer`, because the
+    // Rust surface routes a pointer through the same rules and a second copy of them would
+    // diverge silently. Only the C contract (codes in, result codes out) is here.
+    let cell = host.renderer.cell_metrics();
+    let encoded = host.mouse.button(
+        &host.frame,
+        cell,
+        crate::pointer::Input { action, code: button, mods: mouse_mods(mods), x, y },
+    );
+    match encoded {
+        Some(bytes) => match host.host.send(&bytes) {
+            Ok(()) => TermisuHostResult::Success,
+            Err(_) => TermisuHostResult::SendFailed,
+        },
+        None => TermisuHostResult::Ignored,
+    }
+}
+
+/// Feeds one keyboard event to the key encoder and writes the result to the pty.
+///
+/// `action`: 0 release, 1 press, 2 repeat. `key`: the C key enum from
+/// `ghostty/vt/key/event.h` (KeyMap.swift's values). `mods`/`consumed_mods`: the
+/// GhosttyMods bitmask (shift 1, ctrl 2, alt 4, super 8, caps 16, num 32).
+/// `text`/`text_len`: the translated UTF-8 for the event, or NULL/0 when the key
+/// produced none. `unshifted_codepoint`: the key's codepoint with no modifiers, 0
+/// when it has none.
+///
+/// Every encoding mode rides the last polled frame -- DECCKM, keypad application,
+/// 1035/1036, modifyOtherKeys, and the active screen's kitty flags -- so a kitty
+/// negotiation takes effect at the very next keystroke a rendering host forwards.
+/// Returns `Success` when bytes were written, `Ignored` when the event encodes to
+/// nothing (a bare modifier under legacy modes, a release without report-events,
+/// mid-IME composition), `InvalidValue` for an out-of-range action/key or invalid
+/// UTF-8.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`; `text`, if non-NULL, must
+/// point to `text_len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_key(
+    host: *mut TermisuHost,
+    action: u32,
+    key: u32,
+    mods: u32,
+    consumed_mods: u32,
+    text: *const u8,
+    text_len: usize,
+    unshifted_codepoint: u32,
+) -> TermisuHostResult {
+    use termisu_vt_pty::key::{Key, KeyAction, KeyEvent, KeyOptions, OptionAsAlt};
+    if host.is_null() || action > 2 {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    let action = match action {
+        0 => KeyAction::Release,
+        1 => KeyAction::Press,
+        _ => KeyAction::Repeat,
+    };
+    // Key::ALL is in C declaration order by construction, so the C value indexes it.
+    let Some(&key) = Key::ALL.get(key as usize) else {
+        return TermisuHostResult::InvalidValue;
+    };
+    let utf8 = if text.is_null() || text_len == 0 {
+        ""
+    } else {
+        match std::str::from_utf8(unsafe { std::slice::from_raw_parts(text, text_len) }) {
+            Ok(text) => text,
+            Err(_) => return TermisuHostResult::InvalidValue,
+        }
+    };
+
+    let encoded = termisu_vt_pty::key::encode(
+        &KeyEvent {
+            action,
+            key,
+            mods: mods as u16,
+            consumed_mods: consumed_mods as u16,
+            composing: false,
+            utf8,
+            unshifted_codepoint,
+        },
+        &KeyOptions {
+            cursor_key_application: host.frame.cursor_keys(),
+            keypad_key_application: host.frame.keypad_keys(),
+            ignore_keypad_with_numlock: host.frame.ignore_keypad_with_numlock(),
+            alt_esc_prefix: host.frame.alt_esc_prefix(),
+            modify_other_keys_state_2: host.frame.modify_other_keys_2(),
+            kitty_flags: host.frame.kitty_key_flags(),
+            // The window owns option-as-alt policy; none is configured yet, and False
+            // matches what setopt_from_terminal resets it to.
+            macos_option_as_alt: OptionAsAlt::False,
+            backarrow_key_mode: false,
+        },
+    );
+    if encoded.is_empty() {
+        return TermisuHostResult::Ignored;
+    }
+    match host.host.send(&encoded) {
+        Ok(()) => TermisuHostResult::Success,
+        Err(_) => TermisuHostResult::SendFailed,
+    }
+}
+
+/// Routes a wheel gesture through the terminal's three-way precedence, the oracle's
+/// own (`Surface.zig` scrollCallback): an active mouse mode gets wheel-button reports
+/// (64/65); otherwise the alternate screen with alternate scroll (1007, default on)
+/// gets arrow keys, `ESC O` form under DECCKM and `ESC [` otherwise; otherwise the
+/// event is `Ignored` and the embedder scrolls its viewport.
+///
+/// `ticks` is whole wheel notches, positive UP (toward history); the embedder owns
+/// fractional banking. Returns `Success` when the terminal consumed the gesture --
+/// including a mouse-mode wheel whose report encoded to nothing (X10 event mode
+/// cannot name wheel buttons), because a program that captured the mouse must not
+/// ALSO have the view scrolled under it.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_wheel(
+    host: *mut TermisuHost,
+    x: f32,
+    y: f32,
+    ticks: i32,
+    mods: u32,
+) -> TermisuHostResult {
+    if host.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    if ticks == 0 {
+        return TermisuHostResult::Ignored;
+    }
+
+    // `Viewport` is the C surface's `Ignored`: this ABI has no viewport of its own, so handing
+    // the wheel back to the embedder IS the answer. The Rust surface acts on it instead.
+    let cell = host.renderer.cell_metrics();
+    match host
+        .mouse
+        .wheel(&host.frame, cell, x, y, ticks, mouse_mods(mods))
+    {
+        crate::pointer::Wheel::Send(bytes) => {
+            if !bytes.is_empty() && host.host.send(&bytes).is_err() {
+                return TermisuHostResult::SendFailed;
+            }
+            TermisuHostResult::Success
+        }
+        crate::pointer::Wheel::Viewport => TermisuHostResult::Ignored,
+    }
+}
+
+/// Whether a wheel tick with `mods` would scroll the viewport (`termisu_host_wheel` would
+/// answer `Ignored`) rather than reach the child. Asked by a GUI before it shifts the view by
+/// part of a row, so a program that owns the wheel never has the view slide under it.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_wheel_scrolls_viewport(host: *mut TermisuHost, mods: u32) -> bool {
+    if host.is_null() {
+        return false;
+    }
+    let host = unsafe { &*host };
+    let cell = host.renderer.cell_metrics();
+    host.mouse.wheel_scrolls_viewport(&host.frame, cell, mouse_mods(mods))
+}
+
+/// The state behind the opaque workflows handle: parsed templates plus the loader's
+/// error lines, joined for the one-string getter.
+pub struct TermisuWorkflows {
+    workflows: Vec<workflow::Workflow>,
+    errors: String,
+}
+
+/// Field selectors for `termisu_workflow_field` / `termisu_workflow_arg`.
+pub const TERMISU_WORKFLOW_NAME: u32 = 0;
+pub const TERMISU_WORKFLOW_DESCRIPTION: u32 = 1;
+pub const TERMISU_WORKFLOW_COMMAND: u32 = 2;
+pub const TERMISU_WORKFLOW_ARG_DEFAULT: u32 = 2;
+
+/// Copies `value` out through the row_text buffer protocol: NULL `out` sizes, a short
+/// buffer refuses with the needed length, and the copy carries no terminator.
+fn copy_out(value: &str, out: *mut u8, cap: usize, out_len: *mut usize) -> TermisuHostResult {
+    if out_len.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { out_len.write(value.len()) };
+    if out.is_null() || cap < value.len() {
+        return if out.is_null() && cap == 0 {
+            TermisuHostResult::Success
+        } else {
+            TermisuHostResult::InvalidValue
+        };
+    }
+    unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), out, value.len()) };
+    TermisuHostResult::Success
+}
+
+/// Loads the workflow templates from `dir`, or from `~/.ruuah/workflows` when NULL.
+/// Broken files are skipped and their errors kept on the handle
+/// (`termisu_workflows_errors`) -- one bad template never hides the rest. Returns NULL
+/// only when the out-param itself is unusable; an empty or missing directory is a
+/// valid, empty handle.
+///
+/// # Safety
+/// `dir`, if non-NULL, must be a NUL-terminated path; `out` must be valid for one write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_workflows_load(
+    dir: *const c_char,
+    out: *mut *mut TermisuWorkflows,
+) -> TermisuHostResult {
+    if out.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let dir = if dir.is_null() {
+        let Some(home) = std::env::var_os("HOME") else {
+            unsafe { out.write(std::ptr::null_mut()) };
+            return TermisuHostResult::InvalidValue;
+        };
+        Path::new(&home).join(".ruuah").join("workflows")
+    } else {
+        match unsafe { CStr::from_ptr(dir) }.to_str() {
+            Ok(path) => Path::new(path).to_path_buf(),
+            Err(_) => {
+                unsafe { out.write(std::ptr::null_mut()) };
+                return TermisuHostResult::InvalidValue;
+            }
+        }
+    };
+    let (workflows, errors) = workflow::load_dir(&dir);
+    let handle = Box::new(TermisuWorkflows { workflows, errors: errors.join("\n") });
+    unsafe { out.write(Box::into_raw(handle)) };
+    TermisuHostResult::Success
+}
+
+/// # Safety
+/// `handle` must be NULL or a live handle from `termisu_workflows_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_workflows_free(handle: *mut TermisuWorkflows) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+/// # Safety
+/// `handle` must be a live handle from `termisu_workflows_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_workflows_count(handle: *const TermisuWorkflows) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    unsafe { &*handle }.workflows.len() as u32
+}
+
+/// The loader's error lines, newline-joined; empty when every file parsed. The GUI
+/// shows this loudly, the config.rs posture.
+///
+/// # Safety
+/// `handle` live; `out`/`out_len` per the buffer protocol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_workflows_errors(
+    handle: *const TermisuWorkflows,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> TermisuHostResult {
+    if handle.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    copy_out(&unsafe { &*handle }.errors, out, cap, out_len)
+}
+
+/// One workflow's field: 0 name, 1 description, 2 command. The buffer protocol is
+/// row_text's: NULL out sizes, short buffers refuse with the needed length.
+///
+/// # Safety
+/// `handle` live; `out`/`out_len` per the buffer protocol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_workflow_field(
+    handle: *const TermisuWorkflows,
+    index: u32,
+    field: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> TermisuHostResult {
+    if handle.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let Some(workflow) = unsafe { &*handle }.workflows.get(index as usize) else {
+        return TermisuHostResult::InvalidValue;
+    };
+    let value = match field {
+        TERMISU_WORKFLOW_NAME => &workflow.name,
+        TERMISU_WORKFLOW_DESCRIPTION => &workflow.description,
+        TERMISU_WORKFLOW_COMMAND => &workflow.command,
+        _ => return TermisuHostResult::InvalidValue,
+    };
+    copy_out(value, out, cap, out_len)
+}
+
+/// # Safety
+/// `handle` must be a live handle from `termisu_workflows_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_workflow_arg_count(
+    handle: *const TermisuWorkflows,
+    index: u32,
+) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let Some(workflow) = unsafe { &*handle }.workflows.get(index as usize) else {
+        return 0;
+    };
+    workflow.args.len() as u32
+}
+
+/// One argument's field: 0 name, 1 description, 2 default. A missing default answers
+/// `Ignored` with length 0, distinct from an empty-string default -- the palette
+/// prefills one and prompts bare for the other.
+///
+/// # Safety
+/// `handle` live; `out`/`out_len` per the buffer protocol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_workflow_arg(
+    handle: *const TermisuWorkflows,
+    index: u32,
+    arg_index: u32,
+    field: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> TermisuHostResult {
+    if handle.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let Some(arg) = unsafe { &*handle }
+        .workflows
+        .get(index as usize)
+        .and_then(|workflow| workflow.args.get(arg_index as usize))
+    else {
+        return TermisuHostResult::InvalidValue;
+    };
+    let value = match field {
+        TERMISU_WORKFLOW_NAME => &arg.name,
+        TERMISU_WORKFLOW_DESCRIPTION => &arg.description,
+        TERMISU_WORKFLOW_ARG_DEFAULT => match &arg.default {
+            Some(default) => default,
+            None => {
+                if !out_len.is_null() {
+                    unsafe { out_len.write(0) };
+                }
+                return TermisuHostResult::Ignored;
+            }
+        },
+        _ => return TermisuHostResult::InvalidValue,
+    };
+    copy_out(value, out, cap, out_len)
+}
+
+/// Renders one workflow's command with its placeholders substituted. `args_blob` is
+/// pairs of NUL-terminated strings (name, value, name, value...), `blob_len` its
+/// total byte length -- NUL separators because values may legally contain `=` or
+/// newlines. An unresolved placeholder refuses with `InvalidValue`: a command with a
+/// hole left in it must never reach the paste path.
+///
+/// # Safety
+/// `handle` live; `args_blob` readable for `blob_len` bytes when non-NULL;
+/// `out`/`out_len` per the buffer protocol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_workflow_render(
+    handle: *const TermisuWorkflows,
+    index: u32,
+    args_blob: *const u8,
+    blob_len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> TermisuHostResult {
+    if handle.is_null() || (args_blob.is_null() && blob_len != 0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    let Some(workflow) = unsafe { &*handle }.workflows.get(index as usize) else {
+        return TermisuHostResult::InvalidValue;
+    };
+    let blob = if blob_len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(args_blob, blob_len) }
+    };
+    let mut parts = blob.split(|&b| b == 0).filter(|part| !part.is_empty());
+    let mut values = Vec::new();
+    while let (Some(name), Some(value)) = (parts.next(), parts.next()) {
+        let (Ok(name), Ok(value)) =
+            (std::str::from_utf8(name), std::str::from_utf8(value))
+        else {
+            return TermisuHostResult::InvalidValue;
+        };
+        values.push((name.to_string(), value.to_string()));
+    }
+    match workflow::render(&workflow.command, &values) {
+        Ok(rendered) => copy_out(&rendered, out, cap, out_len),
+        Err(_) => TermisuHostResult::InvalidValue,
+    }
+}
+
+/// Scrolls the displayed view through scrollback: positive `rows` climbs into history,
+/// negative returns toward the live bottom, and `INT32_MIN` snaps straight to it.
+/// Deltas accumulate on the pump thread and are clamped against what history actually
+/// holds; the landed position comes back in the next polled frame's `viewport_offset`.
+/// Typing does NOT snap the view -- that is the embedder's policy to apply, via
+/// `INT32_MIN`, at whatever input seam it owns.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_scroll(host: *mut TermisuHost, rows: i32) -> TermisuHostResult {
+    if host.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    if rows == i32::MIN {
+        host.host.scroll_to_bottom();
+    } else {
+        host.host.scroll(rows);
+    }
+    TermisuHostResult::Success
+}
+
+/// Resizes the pty, the terminal and the render target.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_resize(
+    host: *mut TermisuHost,
+    cols: u16,
+    rows: u16,
+) -> TermisuHostResult {
+    if host.is_null() || cols == 0 || rows == 0 {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    if host.host.resize(Geometry { cols, rows }).is_err() {
+        return TermisuHostResult::ResizeRefused;
+    }
+    let Some(mut renderer) = build_renderer(
+        &host.gpu,
+        host.font_size,
+        cols,
+        rows,
+        host.font_family.as_deref(),
+        host.ligatures,
+    ) else {
+        return TermisuHostResult::RenderFailed;
+    };
+    // The rebuild starts from the built-in scheme; the theme must survive it, and so must
+    // the caret switch.
+    renderer.set_palette(host.palette.clone());
+    renderer.set_caret(host.caret_painted);
+    host.renderer = renderer;
+    // Everything is owed again on the new canvas, and the old pixels describe a dead
+    // geometry -- the borrowed pointer contract says they die here.
+    host.drawn_generation = 0;
+    host.pixels = Vec::new();
+    host.row_semantics = Vec::new();
+    TermisuHostResult::Success
+}
+
+/// Reports the pixel cell size a renderer would use at `font_size`, without a host.
+///
+/// The GUI's zoom flow needs this BEFORE any renderer at the new size exists: the window
+/// keeps its pixel size, so the new grid is window-pixels over these metrics, and only
+/// then is `termisu_host_set_font_size` called with both. Pure query; builds a font stack
+/// and throws it away.
+///
+/// # Safety
+/// `out_width` and `out_height` must be non-NULL and valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_cell_metrics(
+    font_size: f32,
+    font_family: *const c_char,
+    out_width: *mut u32,
+    out_height: *mut u32,
+) -> TermisuHostResult {
+    if out_width.is_null() || out_height.is_null() || !(font_size > 0.0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    let family = if font_family.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(font_family) }.to_str().ok()
+    };
+    let Ok(fonts) = FontStack::with_primary(family, font_size) else {
+        return TermisuHostResult::RenderFailed;
+    };
+    let metrics = fonts.metrics();
+    unsafe {
+        out_width.write(metrics.width);
+        out_height.write(metrics.height);
+    }
+    TermisuHostResult::Success
+}
+
+/// Changes the font size live: resizes the pty to the new grid and rebuilds the render
+/// target at the new metrics, in one call.
+///
+/// A font change IS a geometry change -- the window keeps its pixel size, so the grid
+/// that fits it moves with the cell metrics. The caller derives `cols`/`rows` from
+/// `termisu_host_cell_metrics` and passes both here; splitting this into set-size plus
+/// `termisu_host_resize` would rebuild the renderer twice and race a poll in between.
+///
+/// # Safety
+/// `host` must be a live handle from `termisu_host_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_set_font_size(
+    host: *mut TermisuHost,
+    font_size: f32,
+    cols: u16,
+    rows: u16,
+) -> TermisuHostResult {
+    if host.is_null() || cols == 0 || rows == 0 || !(font_size > 0.0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    if host.host.resize(Geometry { cols, rows }).is_err() {
+        return TermisuHostResult::ResizeRefused;
+    }
+    let Some(mut renderer) = build_renderer(
+        &host.gpu,
+        font_size,
+        cols,
+        rows,
+        host.font_family.as_deref(),
+        host.ligatures,
+    ) else {
+        return TermisuHostResult::RenderFailed;
+    };
+    renderer.set_palette(host.palette.clone());
+    renderer.set_caret(host.caret_painted);
+    host.renderer = renderer;
+    host.font_size = font_size;
+    host.drawn_generation = 0;
+    host.pixels = Vec::new();
+    host.row_semantics = Vec::new();
+    TermisuHostResult::Success
+}
+
+/// Copies one grid row's text as UTF-8 into `out`, trailing blanks trimmed.
+///
+/// `semantic` filters by the per-cell OSC 133 mark: `TERMISU_TEXT_ALL` (255) takes every
+/// cell; `TERMISU_ROW_OUTPUT`/`TERMISU_ROW_PROMPT`/`TERMISU_ROW_INPUT` take only cells wearing
+/// that mark (a filtered-out cell contributes nothing, not a space). This is what makes
+/// "copy command" exact: the prompt row holds `$ ls -la`, and the input filter returns
+/// `ls -la` alone.
+///
+/// Reads the last POLLED frame -- poll at least once first; a rendering host does so
+/// continuously. Spacer cells of wide glyphs are skipped, so a row with emoji comes back
+/// as its clusters once each. Writes at most `cap` bytes (no NUL terminator is added),
+/// stores the full length in `*len`, and fails with INVALID_VALUE when the row is out of
+/// range or no frame has been polled. A `cap` smaller than `*len` copies the truncated
+/// prefix (backed off to a UTF-8 boundary); the caller sizes `cap` from it and calls
+/// again.
+///
+/// This is the copy-command/copy-output seam for blocks (S2): the GUI groups rows with
+/// `row_semantics` and reads the text of the rows it selected.
+///
+/// Pops the next host-facing event: 0 = none pending, 1 = set the system clipboard to
+/// the payload bytes, 2 = post a notification (payload is `title\ntitle-less body` --
+/// the first newline separates title from body), 3 = bell (no payload), 4 = the
+/// program set its title (payload = UTF-8 text), 5 = OSC 9;4 progress (payload = two
+/// bytes: state 0..4, value 0..100).
+///
+/// One event per call, oldest first, exactly-once -- but an event is CONSUMED only
+/// when `cap` held its whole payload. A smaller `cap` (zero included) reports kind and
+/// `*len` and leaves the event queued, so the two-call size-then-fetch pattern works
+/// without losing anything. The embedder decides policy -- the terminal only relays
+/// what the child asked for.
+///
+/// # Safety
+/// `host` must be a live handle; `kind` and `len` must be non-NULL; `out` must point to
+/// `cap` writable bytes or be NULL when `cap` is 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_next_event(
+    host: *mut TermisuHost,
+    kind: *mut u32,
+    out: *mut u8,
+    cap: usize,
+    len: *mut usize,
+) -> TermisuHostResult {
+    use termisu_vt_core::events::Event;
+
+    if host.is_null() || kind.is_null() || len.is_null() || (out.is_null() && cap != 0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe {
+        kind.write(0);
+        len.write(0);
+    }
+    let host = unsafe { &mut *host };
+    if host.pending_events.is_empty() {
+        host.pending_events.extend(host.host.take_events());
+    }
+    let Some(event) = host.pending_events.front() else {
+        return TermisuHostResult::Success;
+    };
+
+    let (code, payload): (u32, Vec<u8>) = match event {
+        Event::ClipboardSet(bytes) => (1, bytes.clone()),
+        Event::Notify { title, body } => {
+            let mut payload = title.clone().into_bytes();
+            payload.push(b'\n');
+            payload.extend_from_slice(body.as_bytes());
+            (2, payload)
+        }
+        Event::Bell => (3, Vec::new()),
+        Event::Title(title) => (4, title.clone().into_bytes()),
+        Event::Progress { state, value } => (5, vec![*state, *value]),
+        Event::CommandStart => (6, Vec::new()),
+        // OSC 7. The payload is the raw report, usually a file:// URI: the host decodes
+        // it, because percent-decoding here would diverge from the core's stored value
+        // and from the oracle, and the seam's job is delivery rather than interpretation.
+        Event::Pwd(pwd) => (7, pwd.clone()),
+    };
+    unsafe {
+        kind.write(code);
+        len.write(payload.len());
+    }
+    if payload.len() > cap {
+        // Sizing call: the event stays queued for the fetch that fits it.
+        return TermisuHostResult::Success;
+    }
+    if !payload.is_empty() {
+        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), out, payload.len()) };
+    }
+    host.pending_events.pop_front();
+    TermisuHostResult::Success
+}
+
+/// Selects the word under one cell, the double-click gesture.
+///
+/// Cell coordinates, viewport-relative, the same space `termisu_host_link_at` uses: the
+/// embedder owns pixels because it owns the view, and `termisu_host_cell_metrics` is how it
+/// converts. `*found` is false when there is nothing selectable there, which is an ORDINARY
+/// answer rather than an error -- a double-click on blank space selects nothing, and a host
+/// told that was a failure would treat every such click as one. INVALID_VALUE is reserved for
+/// a cell outside the grid or a host that has never polled.
+///
+/// The policy lives in `crate::select` and `Session` calls the same function. Two entry points
+/// into two copies of a behaviour is how they drift, and this capability has already been
+/// missing from exactly one of the two host paths for the whole life of the project.
+///
+/// # Safety
+/// `host` must be a live handle; `found` must be non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_select_word_at(
+    host: *mut TermisuHost,
+    col: u16,
+    row: u16,
+    found: *mut bool,
+) -> TermisuHostResult {
+    unsafe { select_probe(host, col, row, found, crate::select::word_at) }
+}
+
+/// Selects the line under one cell, the triple-click gesture. Trailing blanks are trimmed by
+/// the oracle's own rule, so a 40-column row holding 19 characters copies 19.
+///
+/// Same contract as [`termisu_host_select_word_at`].
+///
+/// # Safety
+/// `host` must be a live handle; `found` must be non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_select_line_at(
+    host: *mut TermisuHost,
+    col: u16,
+    row: u16,
+    found: *mut bool,
+) -> TermisuHostResult {
+    unsafe { select_probe(host, col, row, found, crate::select::line_at) }
+}
+
+/// Extends a drag: the range from `anchor` to the cell the pointer holds.
+///
+/// The anchor is the embedder's to remember, because the gesture is the embedder's: a drag is
+/// a press, a stream of moves and a release, and only the view knows which press started this
+/// one. Endpoint order is the GESTURE's rather than reading order, so a drag upward is not
+/// silently reversed.
+///
+/// # Safety
+/// `host` must be a live handle; `found` must be non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_select_to(
+    host: *mut TermisuHost,
+    anchor_col: u16,
+    anchor_row: u16,
+    col: u16,
+    row: u16,
+    found: *mut bool,
+) -> TermisuHostResult {
+    if host.is_null() || found.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { found.write(false) };
+    let host = unsafe { &mut *host };
+    if !crate::select::in_grid(&host.frame, col, row)
+        || !crate::select::in_grid(&host.frame, anchor_col, anchor_row)
+    {
+        return TermisuHostResult::InvalidValue;
+    }
+    let hit = crate::select::extend(
+        &mut host.frame,
+        &mut host.drawn_generation,
+        (anchor_col, anchor_row),
+        (col, row),
+    );
+    unsafe { found.write(hit) };
+    TermisuHostResult::Success
+}
+
+/// Selects the whole VISIBLE grid.
+///
+/// Visible, not the whole scrollback: a frame is a viewport and history is not in it. Said out
+/// loud because the core's own `All` DOES reach into history, and the two answering
+/// differently is a difference a person can see.
+///
+/// # Safety
+/// `host` must be a live handle; `found` must be non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_select_all(
+    host: *mut TermisuHost,
+    found: *mut bool,
+) -> TermisuHostResult {
+    if host.is_null() || found.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { found.write(false) };
+    let host = unsafe { &mut *host };
+    if !host.frame.is_valid() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let hit = crate::select::all_visible(&mut host.frame, &mut host.drawn_generation);
+    unsafe { found.write(hit) };
+    TermisuHostResult::Success
+}
+
+/// Drops the highlight. Clearing nothing is success, not an error.
+///
+/// # Safety
+/// `host` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_select_clear(host: *mut TermisuHost) -> TermisuHostResult {
+    if host.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let host = unsafe { &mut *host };
+    crate::select::clear(&mut host.frame, &mut host.drawn_generation);
+    TermisuHostResult::Success
+}
+
+/// Copies the clipboard text for the current highlight into `out`.
+///
+/// Nothing selected is SUCCESS with `*len` 0, the same shape `termisu_host_link_at` uses for a
+/// cell with no link. Truncation contract matches it too: call once with `cap` 0 to size, then
+/// again with a buffer that fits.
+///
+/// The text comes from `termisu_vt_core::selection::format`, which the differential corpus
+/// measures against the real `libghostty-vt` -- soft-wrap joining, trailing whitespace and all.
+/// An embedder that walked the grid itself would produce text that looks right and pastes
+/// wrong.
+///
+/// # Safety
+/// `host` must be a live handle; `out` must point to `cap` writable bytes or be NULL when
+/// `cap` is 0; `len` must be non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_selection_text(
+    host: *mut TermisuHost,
+    out: *mut u8,
+    cap: usize,
+    len: *mut usize,
+) -> TermisuHostResult {
+    if host.is_null() || len.is_null() || (out.is_null() && cap != 0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { len.write(0) };
+    let host = unsafe { &*host };
+    let Some(text) = crate::select::text(&host.frame) else {
+        return TermisuHostResult::Success;
+    };
+    let bytes = text.as_bytes();
+    unsafe { len.write(bytes.len()) };
+    if cap > 0 {
+        let mut take = bytes.len().min(cap);
+        // Back off to a UTF-8 boundary so a truncated read is still valid UTF-8 rather than a
+        // torn code unit, exactly as `termisu_host_link_at` does.
+        while take > 0 && !text.is_char_boundary(take) {
+            take -= 1;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, take) };
+    }
+    TermisuHostResult::Success
+}
+
+/// Shared body of the two cell probes: the null and range checks, then the policy.
+///
+/// # Safety
+/// `host` must be a live handle or NULL; `found` must be non-NULL or NULL.
+unsafe fn select_probe(
+    host: *mut TermisuHost,
+    col: u16,
+    row: u16,
+    found: *mut bool,
+    probe: fn(&mut Frame, &mut u64, u16, u16) -> bool,
+) -> TermisuHostResult {
+    if host.is_null() || found.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { found.write(false) };
+    let host = unsafe { &mut *host };
+    // The range rule is `crate::select::in_grid` and NOT a second copy written here. It was
+    // both for one commit, and a mutant proved the cost: breaking the policy's copy changed
+    // nothing, because this path never reached it. Two copies of one rule is how the
+    // capability this whole module exists to unify went missing in the first place.
+    if !crate::select::in_grid(&host.frame, col, row) {
+        return TermisuHostResult::InvalidValue;
+    }
+    let hit = probe(&mut host.frame, &mut host.drawn_generation, col, row);
+    unsafe { found.write(hit) };
+    TermisuHostResult::Success
+}
+
+/// Copies the OSC 8 URI under one cell into `out`, if the cell was printed inside a
+/// hyperlink.
+///
+/// Reads the last POLLED frame, like `termisu_host_row_text`. A cell with no link is
+/// SUCCESS with `*len` 0 -- a click on plain text is not an error. INVALID_VALUE only
+/// for an out-of-range cell or a host that has never polled. Truncation contract
+/// matches `termisu_host_row_text` (size `cap` from a first call's `*len`).
+///
+/// # Safety
+/// `host` must be a live handle; `out` must point to `cap` writable bytes or be NULL
+/// when `cap` is 0; `len` must be non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_link_at(
+    host: *mut TermisuHost,
+    col: u16,
+    row: u16,
+    out: *mut u8,
+    cap: usize,
+    len: *mut usize,
+) -> TermisuHostResult {
+    if host.is_null() || len.is_null() || (out.is_null() && cap != 0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { len.write(0) };
+    let host = unsafe { &mut *host };
+    if !host.frame.is_valid() || row >= host.frame.rows || col >= host.frame.cols {
+        return TermisuHostResult::InvalidValue;
+    }
+    let Some(uri) = host.frame.link(col, row) else {
+        return TermisuHostResult::Success;
+    };
+    let bytes = uri.as_bytes();
+    unsafe { len.write(bytes.len()) };
+    if cap > 0 {
+        let mut take = bytes.len().min(cap);
+        while take > 0 && !uri.is_char_boundary(take) {
+            take -= 1;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, take) };
+    }
+    TermisuHostResult::Success
+}
+
+/// Copies the absolute path of the FILE a cmd+click at one cell means, with its line and
+/// column when the text named them (`src/main.rs:42:7`).
+///
+/// An OSC 8 `file://` link under the cell wins; any other OSC 8 link answers nothing, since
+/// the embedder opens URLs itself through `termisu_host_link_at`. Otherwise the policy is
+/// `paths::target_at`: the path-like text under the cell, joined across soft wraps, resolved
+/// against `cwd_raw` (the pane's raw OSC 7 report, decoded here by the one decoder) and
+/// `$HOME`, and kept only if it is a regular file.
+///
+/// No file there is SUCCESS with `*len` 0. `line` and `column` are written 0 when absent.
+/// Reads the last POLLED frame; truncation contract as `termisu_host_row_text`.
+///
+/// # Safety
+/// `host` must be a live handle; `cwd_raw` readable for `cwd_len` bytes or NULL with 0;
+/// `out` must point to `cap` writable bytes or be NULL when `cap` is 0; `len`, `line` and
+/// `column` must be non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_path_at(
+    host: *mut TermisuHost,
+    col: u16,
+    row: u16,
+    cwd_raw: *const u8,
+    cwd_len: usize,
+    out: *mut u8,
+    cap: usize,
+    len: *mut usize,
+    line: *mut u32,
+    column: *mut u32,
+) -> TermisuHostResult {
+    if host.is_null()
+        || len.is_null()
+        || line.is_null()
+        || column.is_null()
+        || (out.is_null() && cap != 0)
+        || (cwd_raw.is_null() && cwd_len != 0)
+    {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe {
+        len.write(0);
+        line.write(0);
+        column.write(0);
+    }
+    let host = unsafe { &mut *host };
+    if !host.frame.is_valid() || row >= host.frame.rows || col >= host.frame.cols {
+        return TermisuHostResult::InvalidValue;
+    }
+    let target = match host.frame.link(col, row) {
+        Some(uri) => crate::paths::file_link(uri),
+        None => {
+            let cwd = unsafe { normalized_cwd(cwd_raw, cwd_len) }.map(std::path::PathBuf::from);
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            crate::paths::target_at(
+                &host.frame.viewport_rows(),
+                col,
+                row,
+                cwd.as_deref(),
+                home.as_deref(),
+            )
+        }
+    };
+    let Some(target) = target else {
+        return TermisuHostResult::Success;
+    };
+    // A path that is not UTF-8 cannot cross this ABI as text; it answers nothing rather
+    // than a lossy name that would open a different file or none.
+    let Some(text) = target.path.to_str() else {
+        return TermisuHostResult::Success;
+    };
+    let bytes = text.as_bytes();
+    unsafe {
+        len.write(bytes.len());
+        line.write(target.line.unwrap_or(0));
+        column.write(target.column.unwrap_or(0));
+    }
+    if cap > 0 {
+        let mut take = bytes.len().min(cap);
+        while take > 0 && !text.is_char_boundary(take) {
+            take -= 1;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, take) };
+    }
+    TermisuHostResult::Success
+}
+
+/// One row's share of what a cmd+click would act on: cells `start..end`, end exclusive.
+/// Mirrors `paths::CellRun` across the C ABI.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TermisuHostCellRun {
+    pub row: u16,
+    pub start: u16,
+    pub end: u16,
+}
+
+/// The cells of the OSC 8 link under (col, row): the contiguous cells carrying the same
+/// URI, continuing across a row edge when the run reaches it, since a link a child printed
+/// past the margin wraps like any text.
+fn link_runs(frame: &Frame, col: u16, row: u16, uri: &str) -> Vec<TermisuHostCellRun> {
+    let same = |x: u16, y: u16| frame.link(x, y) == Some(uri);
+    let last = frame.cols - 1;
+    // Walk back to the first cell of the link, crossing row starts.
+    let (mut x, mut y) = (col, row);
+    loop {
+        if x > 0 && same(x - 1, y) {
+            x -= 1;
+        } else if x == 0 && y > 0 && same(last, y - 1) {
+            (x, y) = (last, y - 1);
+        } else {
+            break;
+        }
+    }
+    let mut runs = Vec::new();
+    loop {
+        let start = x;
+        while x < last && same(x + 1, y) {
+            x += 1;
+        }
+        runs.push(TermisuHostCellRun { row: y, start, end: x + 1 });
+        if x == last && y + 1 < frame.rows && same(0, y + 1) {
+            (x, y) = (0, y + 1);
+        } else {
+            break;
+        }
+    }
+    runs
+}
+
+/// # Safety
+/// `host` must be a live handle; `cwd_raw` must point to `cwd_len` readable bytes or be NULL
+/// when `cwd_len` is 0; `out` must point to `cap` writable runs or be NULL when `cap` is 0;
+/// `count` must be non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_link_span_at(
+    host: *mut TermisuHost,
+    col: u16,
+    row: u16,
+    cwd_raw: *const u8,
+    cwd_len: usize,
+    out: *mut TermisuHostCellRun,
+    cap: usize,
+    count: *mut usize,
+) -> TermisuHostResult {
+    if host.is_null() || count.is_null() || (out.is_null() && cap != 0) || (cwd_raw.is_null() && cwd_len != 0)
+    {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { count.write(0) };
+    let host = unsafe { &mut *host };
+    if !host.frame.is_valid() || row >= host.frame.rows || col >= host.frame.cols {
+        return TermisuHostResult::InvalidValue;
+    }
+    // The same decision `termisu_host_path_at` and the embedder's openLink make: a link
+    // first (a web link opens as a URL, a file:// link only when it names a file), else
+    // printed text that resolves to a file. Anything a click would not open gets no runs.
+    let runs: Vec<TermisuHostCellRun> = match host.frame.link(col, row) {
+        Some(uri) if !uri.starts_with("file:") || crate::paths::file_link(uri).is_some() => {
+            let uri = uri.to_owned();
+            link_runs(&host.frame, col, row, &uri)
+        }
+        Some(_) => Vec::new(),
+        None => {
+            let cwd = unsafe { normalized_cwd(cwd_raw, cwd_len) }.map(std::path::PathBuf::from);
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            crate::paths::target_span_at(
+                &host.frame.viewport_rows(),
+                col,
+                row,
+                cwd.as_deref(),
+                home.as_deref(),
+            )
+            .map(|(_, runs)| {
+                runs.into_iter()
+                    .map(|r| TermisuHostCellRun { row: r.row, start: r.start, end: r.end })
+                    .collect()
+            })
+            .unwrap_or_default()
+        }
+    };
+    unsafe { count.write(runs.len()) };
+    if cap > 0 {
+        let take = runs.len().min(cap);
+        unsafe { std::ptr::copy_nonoverlapping(runs.as_ptr(), out, take) };
+    }
+    TermisuHostResult::Success
+}
+
+/// # Safety
+/// `host` must be a live handle; `out` must point to `cap` writable bytes or be NULL when
+/// `cap` is 0; `len` must be non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_row_text(
+    host: *mut TermisuHost,
+    row: u16,
+    semantic: u8,
+    out: *mut u8,
+    cap: usize,
+    len: *mut usize,
+) -> TermisuHostResult {
+    if host.is_null() || len.is_null() || (out.is_null() && cap != 0) {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { len.write(0) };
+    let host = unsafe { &mut *host };
+    if !host.frame.is_valid() || row >= host.frame.rows {
+        return TermisuHostResult::InvalidValue;
+    }
+
+    let wanted = |cell_semantic: termisu_vt_snapshot::Semantic| match semantic {
+        TERMISU_TEXT_ALL => true,
+        TERMISU_ROW_OUTPUT => cell_semantic == termisu_vt_snapshot::Semantic::Output,
+        TERMISU_ROW_PROMPT => cell_semantic == termisu_vt_snapshot::Semantic::Prompt,
+        TERMISU_ROW_INPUT => cell_semantic == termisu_vt_snapshot::Semantic::Input,
+        _ => false,
+    };
+
+    let mut text = String::new();
+    let mut scratch = [0u8; termisu_vt_frame::CLUSTER_BYTES];
+    for x in 0..host.frame.cols {
+        let cell = host.frame.cell(x, row);
+        if termisu_vt_frame::cell_width(cell) == 0 || !wanted(cell.semantic()) {
+            continue;
+        }
+        let cluster = cell.cluster(&mut scratch);
+        if cluster.is_empty() {
+            text.push(' ');
+        } else {
+            text.push_str(cluster);
+        }
+    }
+    let trimmed = text.trim_end_matches(' ');
+
+    unsafe { len.write(trimmed.len()) };
+    if cap > 0 {
+        let copy = trimmed.len().min(cap);
+        // A UTF-8 boundary is not guaranteed at `copy`; back off to one so a truncated
+        // read is still valid UTF-8 rather than a torn code unit.
+        let boundary = (0..=copy).rev().find(|i| trimmed.is_char_boundary(*i)).unwrap_or(0);
+        unsafe { std::ptr::copy_nonoverlapping(trimmed.as_ptr(), out, boundary) };
+    }
+    TermisuHostResult::Success
+}
+
+/// Tears down the child, the pump thread and the renderer. NULL is a no-op.
+///
+/// # Safety
+/// `host` must be NULL or a live handle from `termisu_host_spawn`, and must not be used
+/// again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_free(host: *mut TermisuHost) {
+    if host.is_null() {
+        return;
+    }
+    drop(unsafe { Box::from_raw(host) });
+}
+
+/// Loads `dir/config.toml` (and the theme it names) into a new handle.
+///
+/// Always yields a usable config: a missing file is the defaults, and a file that could
+/// not be honoured is the defaults plus `termisu_config_error`. `dir` NULL means `~/.ruuah`.
+/// Fails only on a NULL out-param or a non-UTF-8 dir.
+///
+/// # Safety
+/// `dir` must be NULL or a NUL-terminated string; `out` must be non-NULL and valid for
+/// the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_config_load(
+    dir: *const c_char,
+    out: *mut *mut TermisuConfig,
+) -> TermisuHostResult {
+    if out.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { out.write(std::ptr::null_mut()) };
+    let dir = if dir.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(dir) }.to_str() {
+            Ok(text) => Some(Path::new(text).to_path_buf()),
+            Err(_) => return TermisuHostResult::InvalidValue,
+        }
+    };
+
+    let config = Config::load(dir.as_deref());
+    // Interior NULs cannot occur: both strings come from TOML text that CStr::from_ptr
+    // sources would have terminated -- but a file can contain anything, so fall back.
+    let shell = config.shell.as_deref().and_then(|text| CString::new(text).ok());
+    let font_family = config
+        .font_family
+        .as_deref()
+        .and_then(|text| CString::new(text).ok());
+    let error = config.error.as_deref().and_then(|text| CString::new(text).ok());
+    let handle = Box::new(TermisuConfig { config, shell, font_family, error });
+    unsafe { out.write(Box::into_raw(handle)) };
+    TermisuHostResult::Success
+}
+
+/// Font size in logical pixels, 0 when the config does not set one. The embedder applies
+/// its own default and backing-scale factor.
+///
+/// # Safety
+/// `config` must be a live handle from `termisu_config_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_config_font_size(config: *const TermisuConfig) -> f32 {
+    if config.is_null() {
+        return 0.0;
+    }
+    unsafe { &*config }.config.font_size
+}
+
+/// The configured auto-direction, or `fallback` when the config does not say.
+///
+/// # Safety
+/// `config` must be a live handle from `termisu_config_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_config_auto_direction(
+    config: *const TermisuConfig,
+    fallback: bool,
+) -> bool {
+    if config.is_null() {
+        return fallback;
+    }
+    unsafe { &*config }.config.auto_direction.unwrap_or(fallback)
+}
+
+/// Whether the operator granted screen-inspection replies (DECRQCRA, WINOPS 18).
+///
+/// FALSE unless `config.toml` says `reports = true`, and false for a NULL handle.
+/// Exposed so an embedder can show the posture rather than guess it; the grant
+/// itself travels through `TermisuHostOptions.config` at spawn, not through this.
+///
+/// # Safety
+/// `config` must be NULL or a live handle from `termisu_config_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_config_reports(config: *const TermisuConfig) -> bool {
+    if config.is_null() {
+        return false;
+    }
+    unsafe { &*config }.config.reports
+}
+
+/// Whether the embedder may show web-rendered panels (S6 diff review).
+///
+/// FALSE unless `config.toml` says `panels = true`, and false for a NULL handle. The
+/// core is unaffected either way; this is purely the embedder asking what its operator
+/// allowed.
+///
+/// # Safety
+/// `config` must be NULL or a live handle from `termisu_config_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_config_panels(config: *const TermisuConfig) -> bool {
+    if config.is_null() {
+        return false;
+    }
+    unsafe { &*config }.config.panels
+}
+
+/// The configured lead font family, or NULL when unset. Borrowed: valid until
+/// `termisu_config_free`.
+///
+/// # Safety
+/// `config` must be NULL or a live handle from `termisu_config_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_config_font_family(config: *const TermisuConfig) -> *const c_char {
+    if config.is_null() {
+        return std::ptr::null();
+    }
+    match &unsafe { &*config }.font_family {
+        Some(family) => family.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// The configured shell command line, or NULL when unset. Borrowed: valid until
+/// `termisu_config_free` on the same handle.
+///
+/// # Safety
+/// `config` must be a live handle from `termisu_config_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_config_shell(config: *const TermisuConfig) -> *const c_char {
+    if config.is_null() {
+        return std::ptr::null();
+    }
+    match &unsafe { &*config }.shell {
+        Some(shell) => shell.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Everything that went wrong while loading, newline-joined -- or NULL when the load was
+/// clean. Borrowed: valid until `termisu_config_free` on the same handle. A GUI shows this
+/// loudly; a config that silently half-applies is worse than one that errors.
+///
+/// # Safety
+/// `config` must be a live handle from `termisu_config_load`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_config_error(config: *const TermisuConfig) -> *const c_char {
+    if config.is_null() {
+        return std::ptr::null();
+    }
+    match &unsafe { &*config }.error {
+        Some(error) => error.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Frees a config handle. NULL is a no-op. Strings lent by the getters die here.
+///
+/// # Safety
+/// `config` must be NULL or a live handle from `termisu_config_load`, and must not be used
+/// again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_config_free(config: *mut TermisuConfig) {
+    if config.is_null() {
+        return;
+    }
+    drop(unsafe { Box::from_raw(config) });
+}
+
+// -- agents ------------------------------------------------------------------------------
+//
+// The registry in `agent.rs` has been correct and unreachable since the Swift host came back
+// on 2026-08-11: zero exports, so the shipped app could not launch an agent into a pane at
+// all. This is that surface, and it is deliberately four small calls rather than one big one.
+//
+// The guard is the reason for the shape. `agent::screen` refuses to auto-type an
+// approval-bypassing flag on the operator's behalf, and a policy that lives in Rust while the
+// UI builds its own argv in Swift is a policy with a hole in it. So the embedder gets the
+// registry as DATA (`count`/`info`), the machine's answer about what is installed
+// (`resolve`), the guard as a QUESTION it can ask before it even enables a button
+// (`screen`), and a spawn that asks the guard again itself (`spawn_agent`) -- because a check
+// the caller may forget is not a guard.
+
+/// Mirrors `TermisuAgentInfo` in `termisu_host.h`. Every string is a borrowed static: valid for
+/// the life of the process, never freed by the caller.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TermisuAgentInfo {
+    /// The stable id `termisu_agent_resolve` and `termisu_host_spawn_agent` take.
+    pub id: *const c_char,
+    /// For a menu.
+    pub name: *const c_char,
+    /// What to tell an operator who does not have it. Shown instead of a disabled row.
+    pub install_hint: *const c_char,
+    /// How long this agent may sit silent after launch before the silence means failure.
+    /// Agents differ by more than 2x here, which is why it is data rather than a constant.
+    pub spawn_grace_ms: u32,
+    /// True for agents that ignore a prompt passed as argv and must be typed into after they
+    /// come up. The embedder needs this before it decides what to do with the operator's
+    /// first message, and getting it wrong is silent: the prompt is taken as a filename.
+    pub type_after_launch: bool,
+}
+
+/// The C strings the info struct lends out, built once.
+///
+/// `AgentDef`'s fields are Rust `&'static str`, which have no terminator, so a C surface
+/// needs its own copies. They are made once and never freed -- the registry is a compile-time
+/// constant and so is the number of them.
+fn agent_strings() -> &'static [(CString, CString, CString)] {
+    static TABLE: std::sync::OnceLock<Vec<(CString, CString, CString)>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        agent::REGISTRY
+            .iter()
+            .map(|def| {
+                let cstring = |text: &str| {
+                    CString::new(text).expect("registry strings are literals with no interior NUL")
+                };
+                (cstring(def.id), cstring(def.name), cstring(def.install_hint))
+            })
+            .collect()
+    })
+}
+
+/// The probe, app-global.
+///
+/// One cache rather than one per call: its whole value is not walking `PATH` ten times every
+/// time a menu opens, and a fresh `Probe` per call would be a cache that never hits. The
+/// asymmetric freshness (5 minutes for a hit, 10 seconds for a miss) is what makes an agent
+/// installed mid-session appear without a restart -- see `agent::Probe`.
+fn agent_probe() -> &'static std::sync::Mutex<agent::Probe> {
+    static PROBE: std::sync::OnceLock<std::sync::Mutex<agent::Probe>> = std::sync::OnceLock::new();
+    PROBE.get_or_init(|| std::sync::Mutex::new(agent::Probe::default()))
+    // Poison is taken rather than propagated at the lock sites below: a panic elsewhere has
+    // already reported itself, and turning it into a second failure in every later menu open
+    // buries the first one.
+}
+
+/// # Safety
+/// `id` must be NULL or a NUL-terminated string.
+unsafe fn agent_by_id(id: *const c_char) -> Option<&'static agent::AgentDef> {
+    if id.is_null() {
+        return None;
+    }
+    agent::find(unsafe { CStr::from_ptr(id) }.to_str().ok()?)
+}
+
+/// An argv from C as owned strings, or `None` when any element is NULL or not UTF-8.
+///
+/// # Safety
+/// `argv` must be NULL when `argc` is 0, or point to `argc` NUL-terminated strings.
+unsafe fn agent_argv(argv: *const *const c_char, argc: usize) -> Option<Vec<String>> {
+    if argc == 0 {
+        return Some(Vec::new());
+    }
+    if argv.is_null() {
+        return None;
+    }
+    let mut words = Vec::with_capacity(argc);
+    for index in 0..argc {
+        let word = unsafe { *argv.add(index) };
+        if word.is_null() {
+            return None;
+        }
+        words.push(unsafe { CStr::from_ptr(word) }.to_str().ok()?.to_string());
+    }
+    Some(words)
+}
+
+/// How many agent CLIs the registry knows. Indices below `termisu_agent_info` accepts.
+#[unsafe(no_mangle)]
+pub extern "C" fn termisu_agent_count() -> u32 {
+    agent::REGISTRY.len() as u32
+}
+
+/// Describes the agent at `index`. `InvalidValue` for an out-of-range index or a NULL `out`.
+///
+/// Says nothing about whether the agent is INSTALLED -- that is the machine's answer, not the
+/// registry's, and it is `termisu_agent_resolve`.
+///
+/// # Safety
+/// `out` must be non-NULL and valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_agent_info(
+    index: u32,
+    out: *mut TermisuAgentInfo,
+) -> TermisuHostResult {
+    if out.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    let Some(def) = agent::REGISTRY.get(index as usize) else {
+        return TermisuHostResult::InvalidValue;
+    };
+    let (id, name, hint) = &agent_strings()[index as usize];
+    unsafe {
+        out.write(TermisuAgentInfo {
+            id: id.as_ptr(),
+            name: name.as_ptr(),
+            install_hint: hint.as_ptr(),
+            spawn_grace_ms: def.spawn_grace.as_millis() as u32,
+            type_after_launch: def.prompt == agent::Prompt::TypeAfterLaunch,
+        })
+    };
+    TermisuHostResult::Success
+}
+
+/// Where `id`'s binary lives on THIS machine, written to `out` as UTF-8 (no NUL).
+///
+/// `Success` with the path, or `Ignored` with `*out_len` 0 when the agent is not installed --
+/// which is a fact about the machine and not an error, so an embedder can tell it apart from
+/// a bad call and show the install hint instead. `InvalidValue` for an unknown id.
+/// Call with `out` NULL and `cap` 0 to size the buffer first.
+///
+/// The answer is cached; see `agent_probe`.
+///
+/// # Safety
+/// `id` must be a NUL-terminated string; `out` must point to `cap` writable bytes or be NULL
+/// when `cap` is 0; `out_len` must be non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_agent_resolve(
+    id: *const c_char,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> TermisuHostResult {
+    if out_len.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { out_len.write(0) };
+    let Some(def) = (unsafe { agent_by_id(id) }) else {
+        return TermisuHostResult::InvalidValue;
+    };
+    let resolved = agent_probe()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .resolve(def);
+    match resolved {
+        Some(path) => copy_out(&path, out, cap, out_len),
+        None => TermisuHostResult::Ignored,
+    }
+}
+
+/// Asks whether an argv is ours to send: `Success` when it is, `Refused` when it carries a
+/// flag that turns the agent's approvals off.
+///
+/// On a refusal the offending flag is written to `out` and its argv position to `at`, because
+/// an operator has to be told WHICH word to remove -- a message naming the wrong one sends
+/// them hunting. Both out-params are optional; call with `out` NULL and `cap` 0 to size.
+///
+/// Whole argv tokens are matched, never substrings: `--auto` is Factory's auto-approve and
+/// `--autosave` is not, and a guard that refuses the second teaches the operator to route
+/// around the first.
+///
+/// # Safety
+/// `argv` must be NULL when `argc` is 0, or point to `argc` NUL-terminated strings; `out`
+/// must point to `cap` writable bytes or be NULL when `cap` is 0; `at` may be NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_agent_screen(
+    argv: *const *const c_char,
+    argc: usize,
+    at: *mut u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> TermisuHostResult {
+    if out_len.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    unsafe { out_len.write(0) };
+    if !at.is_null() {
+        unsafe { at.write(0) };
+    }
+    let Some(words) = (unsafe { agent_argv(argv, argc) }) else {
+        return TermisuHostResult::InvalidValue;
+    };
+    let Some(found) = agent::screen(&words) else {
+        return TermisuHostResult::Success;
+    };
+    if !at.is_null() {
+        unsafe { at.write(found.at as u32) };
+    }
+    // The copy can still fail on a short buffer, and that failure must not be reported as
+    // "clean": the caller learns the flag did not fit from `*out_len`, and the verdict stays
+    // the refusal it is.
+    let _ = copy_out(&found.flag, out, cap, out_len);
+    TermisuHostResult::Refused
+}
+
+/// Spawns a registry agent into a pane: the same pty, pump and renderer as
+/// `termisu_host_spawn`, with the agent's own binary as the child.
+///
+/// `options.command` is IGNORED -- the child is the agent, resolved from `agent_id`.
+/// Everything else in `options` applies unchanged, `cwd` included.
+///
+/// Returns `Refused` when `argv` carries an approval bypass; nothing is spawned and nothing
+/// is stripped, and `termisu_agent_screen` on the same argv names the flag. `Ignored` when the
+/// agent is simply not installed here. `InvalidValue` for an unknown id or a malformed argv.
+///
+/// The child's environment comes from `launch::dress`, the one place that owns it: HOME as
+/// the working directory unless `options.cwd` says otherwise, a declared TERM (a
+/// Finder-launched app inherits none, and a child with an empty TERM finds no terminfo and
+/// exits before drawing a cell), and the Claude Code session markers scrubbed so an agent in
+/// a pane is its own session rather than a child of whatever launched Termisu.
+///
+/// NOT here: the first prompt. `TermisuAgentInfo.type_after_launch` says which agents need it
+/// typed rather than passed, and sending it is `termisu_host_send` once the pane is up.
+///
+/// # Safety
+/// `options`, `agent_id` and `out` must be non-NULL and valid for the duration of the call;
+/// `argv` must be NULL when `argc` is 0, or point to `argc` NUL-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termisu_host_spawn_agent(
+    options: *const TermisuHostOptions,
+    agent_id: *const c_char,
+    argv: *const *const c_char,
+    argc: usize,
+    out: *mut *mut TermisuHost,
+) -> TermisuHostResult {
+    if options.is_null() || out.is_null() {
+        return TermisuHostResult::InvalidValue;
+    }
+    // The failure contract, same as the shell spawn: the out-param never dangles.
+    unsafe { out.write(std::ptr::null_mut()) };
+    let options = unsafe { options.read() };
+
+    let Some(def) = (unsafe { agent_by_id(agent_id) }) else {
+        return TermisuHostResult::InvalidValue;
+    };
+    let Some(extra) = (unsafe { agent_argv(argv, argc) }) else {
+        return TermisuHostResult::InvalidValue;
+    };
+    // Asked here even though `agent::launch` asks again below. Not redundant: this is the
+    // only refusal the caller can be TOLD apart from a spawn failure, and the one inside
+    // `launch` is what makes it impossible to route around by calling from somewhere else.
+    if agent::screen(&extra).is_some() {
+        return TermisuHostResult::Refused;
+    }
+    let resolved = agent_probe()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .resolve(def);
+    let Some(binary) = resolved else {
+        return TermisuHostResult::Ignored;
+    };
+
+    unsafe {
+        spawn_into(
+            &options,
+            || {
+                let mut command = agent::launch(def, &binary, &extra).ok()?;
+                apply_cwd(&mut command, &options);
+                Some(command)
+            },
+            out,
+        )
+    }
+}

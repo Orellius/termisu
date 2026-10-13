@@ -1,0 +1,1766 @@
+# Differential corpus: byte streams fed identically to libghostty-vt and to termisu-vt.
+#
+# `expect` is the verdict the case is asserted to produce today, not the verdict it
+# should eventually produce. A `diff` case is a to-do list entry: when termisu-vt implements
+# the behaviour, this file fails and the case gets promoted to `match`. That is the
+# point -- the harness is only evidence if it can be wrong.
+#
+# `bytes` is a TOML basic string, so control characters use TOML escapes.
+# ESC is \u001B.
+
+# `declared_cases` is the number of cases this file must contain. `load` refuses a
+# mismatch, because a corpus that silently loses cases still reports a confident verdict
+# over whatever survived -- measured: truncating to 30 printed "30/30 met expectation"
+# and exited 0. Adding or removing a case means updating this number in the same edit.
+declared_cases = 223
+
+# ---------------------------------------------------------------------------
+# Expected to MATCH. These are what the slice 0 stub already implements, and they
+# prove the harness can detect agreement rather than only ever crying difference.
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "empty-stream"
+expect = "match"
+bytes = ""
+note = "A terminal that has been written nothing agrees on geometry, cursor and blankness."
+
+[[case]]
+name = "plain-ascii"
+expect = "match"
+bytes = "hello world"
+note = "Printable ASCII lands in cells and advances the cursor."
+
+[[case]]
+name = "plain-multiline"
+expect = "match"
+bytes = "one\r\ntwo\r\nthree"
+note = "CR and LF move the cursor without erasing, while there is room below."
+
+[[case]]
+name = "backspace-overwrite"
+expect = "match"
+bytes = "abc\b\bX"
+note = "BS moves left and the next print overwrites in place."
+
+# ---------------------------------------------------------------------------
+# Expected to DIFF. Everything the stub does not implement. Each one is a slice
+# ahead, and the reported paths are the specification for that slice.
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "sgr-bold"
+expect = "match"
+bytes = "a\u001B[1mB\u001B[0mc"
+note = "Slice 1: SGR sets and clears attributes on the cells written while active."
+
+[[case]]
+name = "sgr-colours"
+expect = "match"
+bytes = "\u001B[31mred\u001B[38;2;10;20;30mrgb"
+note = "Slice 1: palette and direct-RGB foreground, semicolon form."
+
+[[case]]
+name = "cursor-position"
+expect = "match"
+bytes = "\u001B[3;5Hx"
+note = "Slice 1: CUP absolute cursor movement."
+
+[[case]]
+name = "autowrap-phantom"
+expect = "match"
+cols = 5
+rows = 3
+bytes = "abcdef"
+note = "Slice 2: the DEC phantom state -- the last column defers its wrap until the next printable."
+
+[[case]]
+name = "wide-character"
+expect = "match"
+bytes = "世界x"
+note = "Slice 1: a wide cell claims two columns and leaves a spacer tail."
+
+[[case]]
+name = "combining-mark"
+expect = "match"
+bytes = "é!"
+note = "Slice 1: a grapheme cluster stays in one cell; ranked failure mode 2."
+
+[[case]]
+name = "erase-in-line"
+expect = "match"
+bytes = "abcdef\u001B[2K"
+note = "Slice 2: EL, painting with the current background (BCE)."
+
+[[case]]
+name = "alternate-screen"
+expect = "match"
+bytes = "\u001B[?1049h"
+note = "Slice 2: the alternate screen is a separate buffer with its own cursor."
+
+[[case]]
+name = "scroll-past-bottom"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "1\r\n2\r\n3\r\n4\r\n5"
+note = "Slice 2: writing past the last row scrolls the region."
+
+# ---------------------------------------------------------------------------
+# Slice 1 additions. The gate is "diffs clean against the oracle on plain
+# output", so these push echo, SGR and cursor movement harder than the
+# originals did.
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "sgr-attribute-mix"
+expect = "match"
+bytes = "\u001B[1;3;4;9;53mA\u001B[22;23;24;29;55mB"
+note = "Attributes set together, then cleared individually."
+
+[[case]]
+name = "sgr-rgb-colon-form"
+expect = "match"
+bytes = "\u001B[38:2:200:100:50m\u001B[48:5:17mX"
+note = "The colon sub-parameter colour form, which coexists with the semicolon form."
+
+[[case]]
+name = "sgr-underline-styles"
+expect = "match"
+bytes = "\u001B[4:3m\u001B[58;5;9mcurly\u001B[59m\u001B[4:0m."
+note = "Curly underline plus a separate underline colour, then both cleared."
+
+[[case]]
+name = "sgr-colour-then-attribute"
+expect = "match"
+bytes = "\u001B[38;5;200;1mX"
+note = "An indexed colour must not swallow the SGR parameter that follows it."
+
+[[case]]
+name = "sgr-pen-survives-newline"
+expect = "match"
+bytes = "\u001B[31mred\r\nstill red"
+note = "The pen is terminal state, not per-line state."
+
+[[case]]
+name = "cursor-relative-moves"
+expect = "match"
+bytes = "abc\u001B[2D\u001B[BX\u001B[2A\u001B[CY"
+note = "CUB, CUD, CUU and CUF interleaved with printing."
+
+[[case]]
+name = "cursor-column-and-row"
+expect = "match"
+bytes = "\u001B[5Ga\u001B[3db\u001B[1;1Hc"
+note = "CHA, VPA and CUP absolute addressing."
+
+[[case]]
+name = "cjk-mixed-width"
+expect = "match"
+bytes = "a\u4E16b\u754Cc"
+note = "Wide cells interleaved with narrow ones; the cursor must advance by width."
+
+[[case]]
+name = "emoji-zwj-sequence"
+expect = "match"
+bytes = "\U0001F468\u200D\U0001F469\u200D\U0001F467!"
+note = "Verified 2026-07-28: DEC mode 2027 (grapheme cluster) is off by default, so Ghostty splits a ZWJ family emoji across cells exactly as the zero-width heuristic does. The heuristic is correct for default mode; full UAX #29 segmentation is only needed once mode 2027 is implemented, which is slice 2."
+
+# ---------------------------------------------------------------------------
+# Not built. Slice 2 closed every previous gap, and a corpus where nothing
+# differs cannot demonstrate that the harness detects disagreement -- so these
+# keep the other direction alive AND double as the specification for what is
+# next. Each one is a real, named omission, not a synthetic failure.
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "decaln-alignment-test"
+expect = "diff"
+diff_paths = ["cell[0,0].text", "cell[0,10].text", "cell[0,11].text", "cell[0,12].text", "cell[0,13].text", "cell[0,14].text", "cell[0,15].text", "cell[0,16].text", "cell[0,17].text", "cell[0,18].text", "cell[0,19].text", "cell[0,1].text", "cell[0,2].text", "cell[0,3].text", "cell[0,4].text", "cell[0,5].text", "cell[0,6].text", "cell[0,7].text", "cell[0,8].text", "cell[0,9].text", "cell[1,0].text", "cell[1,10].text", "cell[1,11].text", "cell[1,12].text", "cell[1,13].text", "cell[1,14].text", "cell[1,15].text", "cell[1,16].text", "cell[1,17].text", "cell[1,18].text", "cell[1,19].text", "cell[1,1].text", "cell[1,2].text", "cell[1,3].text", "cell[1,4].text", "cell[1,5].text", "cell[1,6].text", "cell[1,7].text", "cell[1,8].text", "cell[1,9].text", "cell[2,0].text", "cell[2,10].text", "cell[2,11].text", "cell[2,12].text", "cell[2,13].text", "cell[2,14].text", "cell[2,15].text", "cell[2,16].text", "cell[2,17].text", "cell[2,18].text", "cell[2,19].text", "cell[2,1].text", "cell[2,2].text", "cell[2,3].text", "cell[2,4].text", "cell[2,5].text", "cell[2,6].text", "cell[2,7].text", "cell[2,8].text", "cell[2,9].text", "cell[3,0].text", "cell[3,10].text", "cell[3,11].text", "cell[3,12].text", "cell[3,13].text", "cell[3,14].text", "cell[3,15].text", "cell[3,16].text", "cell[3,17].text", "cell[3,18].text", "cell[3,19].text", "cell[3,1].text", "cell[3,2].text", "cell[3,3].text", "cell[3,4].text", "cell[3,5].text", "cell[3,6].text", "cell[3,7].text", "cell[3,8].text", "cell[3,9].text", "cell[4,0].text", "cell[4,10].text", "cell[4,11].text", "cell[4,12].text", "cell[4,13].text", "cell[4,14].text", "cell[4,15].text", "cell[4,16].text", "cell[4,17].text", "cell[4,18].text", "cell[4,19].text", "cell[4,1].text", "cell[4,2].text", "cell[4,3].text", "cell[4,4].text", "cell[4,5].text", "cell[4,6].text", "cell[4,7].text", "cell[4,8].text", "cell[4,9].text"]
+bytes = "\u001B#8"
+note = "DECALN fills the screen with E. Sequences carrying a # intermediate are not dispatched."
+
+[[case]]
+name = "selective-erase"
+expect = "match"
+bytes = "abcdef\u001B[?1K"
+note = "DECSEL erases like EL when nothing is protected. Promoted DIFF->MATCH by the selective-erase slice - and the old note was WRONG about who diverged: the oracle dispatched the ?-form all along; this core was the side ignoring it."
+
+[[case]]
+name = "repeat-character"
+expect = "diff"
+diff_paths = ["cell[0,1].text", "cell[0,2].text", "cell[0,3].text", "cell[0,4].text", "cursor.x"]
+bytes = "x\u001B[4b"
+note = "REP repeats the last graphic character. Not implemented."
+
+[[case]]
+name = "insert-replace-mode"
+expect = "match"
+bytes = "abcdef\u001B[1G\u001B[4hXY"
+note = "IRM makes printing insert rather than overwrite. Promoted DIFF->MATCH by the DECRQM slice 2026-08-01: the oracle implements insert mode (Terminal.zig:1374, shift only when not at end of line) and now so does this core."
+
+[[case]]
+name = "grapheme-cluster-mode-2027"
+expect = "diff"
+diff_paths = ["cell[0,0].text", "cell[0,2].text", "cell[0,2].wide", "cell[0,3].wide", "cell[0,4].text", "cell[0,4].wide", "cell[0,5].wide", "cell[0,6].text", "cursor.x"]
+bytes = "\u001B[?2027h\U0001F468\u200D\U0001F469\u200D\U0001F467!"
+note = "With mode 2027 on, a ZWJ sequence is one cluster in one cell. The zero-width heuristic cannot do this; it needs real UAX #29 incremental segmentation."
+
+[[case]]
+name = "reverse-wraparound"
+expect = "diff"
+diff_paths = ["cursor.x", "cursor.y"]
+cols = 6
+rows = 3
+bytes = "\u001B[?45habcdefgh\u001B[1G\u0008"
+note = "Mode 45 lets backspace at column 0 wrap to the end of the previous row. Ghostty has it (modes.zig: reverse_wrap = 45); not implemented here. The first version of this case backspaced on row 0, where there is no previous row, so both sides agreed and it proved nothing."
+
+# ---------------------------------------------------------------------------
+# Slice 3: scrollback. Every case here stays far under the point where either
+# side prunes -- Ghostty's limit is a memory budget scaled by width (measured
+# 2026-07-28: 3000 lines kept 2998 at 6 columns but only 634 at 80), while
+# this core's is a row count, so the prune POLICIES are not comparable. Their
+# CONTENTS are, and that is what these check. Prune policy is unit-tested in
+# history.rs instead.
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "scrollback-basic"
+expect = "match"
+cols = 10
+rows = 3
+scrollback = 50
+bytes = "l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\nl7"
+note = "Rows scrolled off the top land in history, oldest first."
+
+[[case]]
+name = "scrollback-none-without-budget"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "l1\r\nl2\r\nl3\r\nl4\r\nl5"
+note = "With no budget the same stream keeps no history at all. Guards the default."
+
+[[case]]
+name = "scrollback-styles-survive"
+expect = "match"
+cols = 10
+rows = 2
+scrollback = 50
+bytes = "\u001B[31mred\r\n\u001B[1;42mboldgreen\r\nplain\r\nlast"
+note = "A row keeps its styles across the move into a page, which re-interns them into the page's own table."
+
+[[case]]
+name = "scrollback-wrapped-line"
+expect = "match"
+cols = 6
+rows = 2
+scrollback = 50
+bytes = "abcdefghijkl\r\nx\r\ny\r\nz"
+note = "Soft-wrap flags must survive into history, or slice 4 cannot rejoin the logical line."
+
+[[case]]
+name = "scrollback-graphemes"
+expect = "match"
+cols = 8
+rows = 2
+scrollback = 50
+bytes = "e\u0301\u4E16!\r\nsecond\r\nthird\r\nfourth"
+note = "Combining marks and wide cells survive the move into a page."
+
+[[case]]
+name = "scrollback-erased-background"
+expect = "match"
+cols = 8
+rows = 2
+scrollback = 50
+bytes = "\u001B[41m\u001B[2Kfilled\r\nb\r\nc\r\nd"
+note = "A background-only cell keeps its colour in history. This is the case that would have passed silently before the oracle learned to read bg-colour cells."
+
+[[case]]
+name = "scrollback-alt-screen-has-none"
+expect = "match"
+cols = 10
+rows = 2
+scrollback = 50
+bytes = "keep\r\nme\r\n\u001B[?1049ha\r\nb\r\nc\r\nd"
+note = "The alternate screen has no scrollback by protocol; its scrolled rows are discarded."
+
+[[case]]
+name = "scrollback-scroll-region-does-not-feed-history"
+expect = "match"
+cols = 10
+rows = 5
+scrollback = 50
+bytes = "a\r\nb\r\nc\r\nd\r\ne\u001B[2;4r\u001B[4;1Hx\r\ny\r\nz"
+note = "A region that does not start at the top of the screen pushes rows out inside the screen, not off it. Those must not become history."
+
+[[case]]
+name = "reflow-narrow-rejoins-and-resplits"
+expect = "match"
+cols = 10
+rows = 4
+bytes = "abcdefghijklmno"
+resize = { cols = 5, rows = 4 }
+note = "The slice in one case: a soft-wrapped line rejoins into one logical line and re-splits at the new width."
+
+[[case]]
+name = "reflow-widen-rejoins-the-rows"
+expect = "match"
+cols = 5
+rows = 4
+bytes = "abcdefghijklmno"
+resize = { cols = 10, rows = 4 }
+note = "The same line widened. Three rows become two, and the deferred wrap is carried verbatim."
+
+[[case]]
+name = "reflow-cursor-lands-past-the-content"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "hi\r\nthere"
+resize = { cols = 5, rows = 3 }
+note = "The cursor sat one cell past the text, so the line extends by an empty continuation row to give that cell a home. Trailing blanks on the OTHER line are trimmed instead."
+
+[[case]]
+name = "reflow-write-through-the-cursor-narrowed"
+expect = "match"
+cols = 10
+rows = 4
+bytes = "abcdefghijklmno"
+resize = { cols = 5, rows = 4 }
+after = "XY"
+note = "Where the cursor ended up, made observable: a grid comparison cannot see a cursor that never writes."
+
+[[case]]
+name = "reflow-write-through-the-cursor-widened"
+expect = "match"
+cols = 5
+rows = 4
+bytes = "abcdefghijklmno"
+resize = { cols = 10, rows = 4 }
+after = "XY"
+note = "The same widening. Also pins that a deferred wrap resolved away from the last column moves down WITHOUT marking a soft wrap."
+
+[[case]]
+name = "reflow-rows-shrink-pushes-into-history"
+expect = "match"
+cols = 10
+rows = 4
+scrollback = 50
+bytes = "l1\r\nl2\r\nl3\r\nl4"
+resize = { cols = 10, rows = 2 }
+note = "Rows leave the top into scrollback rather than being cut from the bottom."
+
+[[case]]
+name = "reflow-rows-grow-pulls-from-history"
+expect = "match"
+cols = 10
+rows = 2
+scrollback = 50
+bytes = "l1\r\nl2\r\nl3\r\nl4"
+resize = { cols = 10, rows = 4 }
+note = "Growth is the inverse: the active area reclaims rows out of scrollback."
+
+[[case]]
+name = "reflow-history-reflows-at-the-new-width"
+expect = "match"
+cols = 10
+rows = 2
+scrollback = 50
+bytes = "abcdefghijklmno\r\nx\r\ny\r\nz"
+resize = { cols = 5, rows = 2 }
+note = "Scrollback is not exempt. History rows re-split like any others, which is why the whole buffer goes through one pass."
+
+[[case]]
+name = "reflow-line-spans-history-and-active"
+expect = "match"
+cols = 10
+rows = 2
+scrollback = 50
+bytes = "abcdefghijklmnopqrstuvwxyz"
+resize = { cols = 5, rows = 2 }
+note = "A logical line straddling the scrollback boundary is still ONE line and rejoins as one."
+
+[[case]]
+name = "reflow-alt-screen-does-not-reflow"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "\u001B[?1049habcdefghijklmno"
+resize = { cols = 5, rows = 3 }
+note = "The ABI documents the alternate screen as not reflowing. Its rows lose columns and keep their identity."
+
+[[case]]
+name = "reflow-alt-screen-rows-shrink"
+expect = "match"
+cols = 10
+rows = 4
+bytes = "\u001B[?1049ha\r\nb\r\nc\r\nd"
+resize = { cols = 10, rows = 2 }
+note = "It has no scrollback, so rows leaving the top are discarded rather than kept."
+
+[[case]]
+name = "reflow-wide-cell-at-the-new-edge"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "abc世界世"
+resize = { cols = 6, rows = 3 }
+note = "A wide cell that cannot fit before the new right edge leaves a spacer head, exactly as printing one there does."
+
+[[case]]
+name = "reflow-grapheme-cluster-survives"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "abcde\u0301fghijklm"
+resize = { cols = 4, rows = 3 }
+note = "Combining marks travel with their cell across the re-split. A cell is not a codepoint."
+
+[[case]]
+name = "reflow-single-column"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "abcde"
+resize = { cols = 1, rows = 3 }
+note = "The degenerate width: every character becomes its own row, and only the last three survive."
+
+[[case]]
+name = "reflow-interior-blank-rows-are-content"
+expect = "match"
+cols = 10
+rows = 5
+bytes = "a\r\n\r\n\r\nd"
+resize = { cols = 10, rows = 3 }
+note = "Blank rows BETWEEN content are real rows and must not be collapsed, while the trailing one is dropped."
+
+[[case]]
+name = "reflow-trailing-blank-rows-are-trimmed-first"
+expect = "match"
+cols = 10
+rows = 4
+bytes = "hi"
+resize = { cols = 10, rows = 2 }
+note = "Shrinking prefers to trim blank rows off the bottom over pushing content into history."
+
+[[case]]
+name = "reflow-no-op-resize"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "abcdefghijklmno"
+resize = { cols = 10, rows = 3 }
+note = "Identical dimensions change nothing, including the wrap flags."
+
+[[case]]
+name = "reflow-resets-the-scroll-region"
+expect = "match"
+cols = 10
+rows = 5
+bytes = "\u001B[2;4r\u001B[3;1Hmid"
+resize = { cols = 10, rows = 4 }
+after = "\r\na\r\nb\r\nc"
+note = "DECSTBM is set against a screen of a known height, so a resize resets it rather than carrying it."
+
+[[case]]
+name = "reflow-pending-wrap-at-the-real-edge"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "abcdefghij"
+resize = { cols = 5, rows = 3 }
+after = "Z"
+note = "A wrap deferred at the true last column stays deferred through the reflow, and Z proves where it resolves."
+
+[[case]]
+name = "reflow-styled-blanks-are-content"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "\u001B[41mabc\u001B[K\r\nx"
+resize = { cols = 5, rows = 3 }
+note = "Cells carrying only a background are content, not padding: the trailing-blank trim must not eat them."
+
+[[case]]
+name = "reflow-cursor-parked-past-the-content"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "ab\u001B[1;8H"
+resize = { cols = 5, rows = 3 }
+note = "The cursor addressed beyond the text still has to land somewhere, so the line extends to reach it."
+
+[[case]]
+name = "reflow-both-axes-at-once"
+expect = "match"
+cols = 5
+rows = 2
+scrollback = 50
+bytes = "abcdefghijklmno\r\ntail"
+resize = { cols = 10, rows = 4 }
+note = "Width and height together, with history to reclaim."
+
+[[case]]
+name = "reflow-overflow-reaches-history-in-order"
+expect = "match"
+cols = 10
+rows = 2
+scrollback = 50
+bytes = "abcdefghijklmnopqrst"
+resize = { cols = 4, rows = 2 }
+note = "Narrowing multiplies rows past the screen; the excess reaches scrollback oldest-first."
+
+[[case]]
+name = "reflow-cursor-above-the-rows-that-leave"
+expect = "match"
+cols = 10
+rows = 4
+scrollback = 50
+bytes = "a\r\nb\r\nc\r\nd\u001B[1;1H"
+resize = { cols = 10, rows = 2 }
+note = "A cursor whose row is pushed above the active area cannot follow it, so it clamps to the top."
+
+[[case]]
+name = "reflow-empty-screen"
+expect = "match"
+cols = 10
+rows = 4
+bytes = ""
+resize = { cols = 5, rows = 2 }
+note = "Nothing written at all still has to produce a well-formed grid."
+
+[[case]]
+name = "reflow-saved-cursor-tracks-its-row"
+expect = "match"
+cols = 10
+rows = 4
+scrollback = 50
+bytes = "a\r\nb\r\nc\u001B7\r\nd"
+resize = { cols = 10, rows = 2 }
+after = "\u001B8Q"
+note = "A saved (DECSC) cursor follows its row through the resize; Q lands where DECRC put it."
+
+[[case]]
+name = "reflow-saved-cursor-above-the-active-area"
+expect = "match"
+cols = 10
+rows = 4
+bytes = "abcdefghijklmnop\u001B[1;4H\u001B7\u001B[4;1Hz"
+resize = { cols = 5, rows = 4 }
+after = "\u001B8Q"
+note = "Its row did not survive the reflow, so the saved cursor falls back to the top-left. Upstream calls this case unspecified."
+
+[[case]]
+name = "reflow-saved-cursor-in-trailing-blanks"
+expect = "diff"
+diff_paths = ["cell[1,2].text", "cell[1,4].text", "cursor.pending_wrap", "cursor.x"]
+cols = 10
+rows = 3
+bytes = "ab\r\ncdef\u001B7\u001B[3;1Hz"
+resize = { cols = 5, rows = 3 }
+after = "\u001B8Q"
+note = "NAMED OMISSION. A saved cursor sitting in the blanks past its row's text is clamped by upstream against the column its sequential writer happens to be parked on (PageList.zig reflowRow, the p.x >= cols_len branch) -- a stale value carried from the PREVIOUS line. Measured 2026-07-28: Q lands at column 2 there and at column 4 here. Reproducing it means emulating that writer's leftover state; the adjacent upstream branch calls this whole area unspecified."
+
+[[case]]
+name = "damage-a-write-dirties-only-its-row"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[1;1HX"
+note = "The dirty flags are reset after `bytes`, so the damage reported is exactly what `after` changed. One cell on row 0, plus row 2 because the cursor LEFT it -- a cursor that changes rows damages both."
+
+[[case]]
+name = "damage-nothing-changed"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+note = "An empty second stream must report no damage at all, or every other damage case proves nothing."
+
+[[case]]
+name = "damage-cursor-move-alone"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[2;5H"
+note = "Moving the cursor writes no cell yet damages two rows: the one it left and the one it arrived at."
+
+[[case]]
+name = "damage-cursor-within-a-row-is-free"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[3;7H"
+note = "Moving WITHIN a row damages nothing. The row is the unit; the column is not."
+
+[[case]]
+name = "damage-cursor-there-and-back"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[1;1H\u001B[3;1H"
+note = "A cursor that leaves a row and returns still leaves the row it passed through dirty, so damage is marked per move rather than derived from where it started and ended."
+
+[[case]]
+name = "damage-sgr-alone-is-free"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[31m"
+note = "Changing the pen touches no cell."
+
+[[case]]
+name = "damage-erase-display-is-full"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[2J"
+note = "A COMPLETE erase is a whole-frame event, not a row-level one."
+
+[[case]]
+name = "damage-erase-to-end-is-partial"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[2;3H\u001B[0J"
+note = "ED 0 leaves content behind, so its per-row damage is real information. Only ED 2 is Full."
+
+[[case]]
+name = "damage-erase-line-is-partial"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[2;1H\u001B[2K"
+note = "Erasing one line damages that line, plus the row the cursor left."
+
+[[case]]
+name = "damage-scroll-is-partial-not-full"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[3;1H\r\nnew"
+note = "A scroll dirties every row and is STILL partial: the distinction is not how many rows changed but whether per-row information means anything."
+
+[[case]]
+name = "damage-alt-screen-switch-is-full"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[?1049h"
+note = "Switching screens rebuilds everything. Also pins that entering the alternate screen leaves the cursor where it was rather than homing it."
+
+[[case]]
+name = "damage-ris-is-full"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001Bc"
+note = "RIS rebuilds everything."
+
+[[case]]
+name = "damage-wide-char"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[2;1H世"
+note = "A wide cell damages its row like any other write."
+
+[[case]]
+name = "damage-rewriting-identical-text"
+expect = "match"
+cols = 10
+rows = 3
+damage = true
+bytes = "top\r\nmiddle\r\nbottom"
+after = "\u001B[1;1Htop"
+note = "Damage is write-based, not a content diff: writing the same text over itself still dirties the row."
+
+# --- OSC 133 semantic prompt (slice 5.6) -------------------------------------
+# Every case here is expect = "diff" because the core has no OSC handling at all: it
+# reports every cell as Output and every row as None. That is precisely the blind spot
+# slice 5.6's harness extension exists to expose, and each case gets promoted to
+# expect = "match" as the core learns the rule it pins. The rules themselves were measured
+# against the real library and are asserted in crates/ghostty/tests/semantic.rs.
+
+[[case]]
+name = "semantic-prompt-start"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A\u0007$ "
+note = "OSC 133;A marks the cells it writes as Prompt and the row as Prompt. Only written cells are marked."
+
+[[case]]
+name = "semantic-input-after-b"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007ls"
+note = "B switches the cursor to Input. The row keeps its Prompt mark; the row mark is not a summary of the cells."
+
+[[case]]
+name = "semantic-output-after-c"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007ls\u001B]133;C\u0007ok"
+note = "C returns the cursor to Output, giving one row holding all three content types."
+
+[[case]]
+name = "semantic-fresh-line"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "xy\u001B]133;A\u0007$"
+note = "A is fresh-line-then-prompt: with the cursor off the left margin it moves down first, so the prompt lands on row 1."
+
+[[case]]
+name = "semantic-fresh-line-noop-at-margin"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "xy\r\n\u001B]133;A\u0007$"
+note = "The same sequence with the cursor already at the left margin does not move: the prompt lands on the row it was already on."
+
+[[case]]
+name = "semantic-newline-continuation"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007one\r\ntwo"
+note = "A newline taken in a non-output state marks the row it lands on as a continuation, so a row can be a prompt continuation while holding Input cells."
+
+[[case]]
+name = "semantic-clear-at-eol-ends-at-newline"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;I\u0007one\r\ntwo"
+note = "I is input terminated by end-of-line, so the newline resets the cursor to Output instead of marking a continuation. The one place B and I diverge."
+
+[[case]]
+name = "semantic-soft-wrap-input"
+expect = "match"
+cols = 4
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007abcdef"
+note = "A soft wrap preserves the cursor's semantic state, so input continues onto the wrapped row and that row is marked a continuation."
+
+[[case]]
+name = "semantic-soft-wrap-clear-at-eol"
+expect = "match"
+cols = 4
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;I\u0007abcdef"
+note = "The same wrap under I keeps the cells Input but leaves the row unmarked: index() cleared the mark before printWrap restored the state."
+
+[[case]]
+name = "semantic-c-at-column-zero-unmarks"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A\u0007$ p\r\n\u001B]133;C\u0007out"
+note = "C arriving at column 0 on a marked row un-marks it. A workaround for shells that emit no continuation marker, and it fires on position, not content."
+
+[[case]]
+name = "semantic-c-mid-row-keeps-mark"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007ls\u001B]133;C\u0007out"
+note = "The same C away from column 0 leaves the row mark alone, which is what makes the rule positional rather than a general reset."
+
+[[case]]
+name = "semantic-explicit-continuation"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007x\r\n\u001B]133;P;k=c\u0007> "
+note = "P with k=c marks the row a continuation directly, which is what a shell with a PS2 emits."
+
+[[case]]
+name = "semantic-overwrite-replaces-cell-mark"
+expect = "match"
+cols = 12
+rows = 2
+bytes = "\u001B]133;A\u0007$ abc\u001B]133;C\u0007\rXY"
+note = "Cell semantics are written at print time, so overwriting replaces the mark. The row mark is not recomputed and survives."
+
+[[case]]
+name = "semantic-erase-keeps-row-mark"
+expect = "match"
+cols = 12
+rows = 2
+bytes = "\u001B]133;A\u0007$ abc\u001B[2K"
+note = "Erasing a line clears the cells' semantics with their text but leaves the row mark standing."
+
+[[case]]
+name = "semantic-survives-into-history"
+expect = "match"
+cols = 4
+rows = 2
+scrollback = 100
+bytes = "\u001B]133;A\u0007$ abcdef\r\nz\r\ny\r\nx"
+note = "Both layers cross into scrollback intact. Pinned because a reporting gap once made it look as though they did not."
+
+[[case]]
+name = "semantic-alt-screen-inherits-the-cursor-state"
+expect = "match"
+cols = 12
+rows = 2
+bytes = "\u001B]133;A\u0007$ p\u001B[?1049h\u001B]133;B\u0007alt"
+note = "The alternate screen starts with no marks of its own, but the cursor carries its semantic state across the switch, so text written after the switch is still Input. A case that only switches screens matches trivially: the snapshot observes the active screen, and both sides agree it is blank."
+
+# --- OSC 133 across a reflow ------------------------------------------------
+# Upstream's reflow writer copies each source row's mark onto the destination row it is
+# filling, so the last source row to contribute wins. Measured 2026-07-28.
+
+[[case]]
+name = "reflow-semantic-split"
+expect = "match"
+cols = 20
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007abcdefghij"
+resize = { cols = 8, rows = 3 }
+note = "Narrowing one prompt row into two leaves BOTH marked prompt, not the second a continuation: a split has a single source row and every destination row takes its mark."
+
+[[case]]
+name = "reflow-semantic-rejoin"
+expect = "match"
+cols = 4
+rows = 4
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007abcdef"
+resize = { cols = 20, rows = 4 }
+note = "Widening a prompt row and its continuation into one row leaves that row marked a continuation: the last source row to contribute wins."
+
+[[case]]
+name = "reflow-semantic-many-to-many"
+expect = "match"
+cols = 4
+rows = 4
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007abcdefgh"
+resize = { cols = 3, rows = 4 }
+note = "Two source rows re-split into three. This is the case the simple last-source-row rule need not cover, because an earlier destination row could still carry an earlier source row's mark."
+
+# ---------------------------------------------------------------------------
+# Behaviour the first 97 cases could not ask about. Found by reading
+# ../ruuah/src/terminal/*.zig rather than by probing, then measured: every
+# `diff` below was predicted from the upstream source and confirmed against the
+# real library. Each note cites the line that defines the rule.
+#
+# These are to-do entries in the documented sense -- when this core implements
+# the behaviour the case fails and gets promoted to `match`.
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "osc133-trailing-garbage-invalidates-the-command"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;Cextra\u0007ok"
+note = "Upstream's OSC 133 parser requires the byte after the action letter to be a semicolon or nothing (osc/parsers/semantic_prompt.zig:352); anything else sets parser.state = .invalid and drops the whole command. Promoted by the S2 wave: the action field must be the letter alone here too."
+
+[[case]]
+name = "osc133-prompt-kind-must-be-one-byte"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A;k=cc\u0007$ "
+note = "readOption(.prompt_kind) takes the value only when its length is 1 (semantic_prompt.zig:203), and the null falls back to .initial, so the row is a plain prompt upstream. Promoted by the S2 wave: the value is taken only at exactly one byte here too."
+
+[[case]]
+name = "osc133-fresh-line-takes-no-options"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "xy\u001B]133;L;1\u0007Z"
+note = "L is the one action upstream rejects outright when anything follows it (semantic_prompt.zig:367), so no fresh line happens and Z lands at column 2 of row 0. Promoted by the S2 wave: L with options is dropped here too."
+
+[[case]]
+name = "osc133-redraw-opt-in-clears-the-prompt-on-resize"
+expect = "diff"
+diff_paths = ["cell[1,0].semantic", "cell[1,0].text", "cell[1,1].semantic", "cell[1,1].text", "cell[1,2].semantic", "cell[1,2].text", "cell[1,3].semantic", "cell[1,3].text"]
+cols = 20
+rows = 3
+resize = { cols = 8, rows = 3 }
+bytes = "\u001B]133;A;redraw=1\u0007$ \u001B]133;B\u0007abcdefghij"
+note = "The C ABI builds terminals with shell_redraws_prompt = .false (c/terminal.zig:376), which is why every other reflow-semantic case matches. redraw=1 turns it back on, and then Screen.resize calls clearPromptForRedraw (Screen.zig:2068, 2161), which blanks every prompt row from the prompt start down because the cursor is in an input region. The option is dropped here."
+
+[[case]]
+name = "osc133-state-does-not-follow-back-out-of-the-alt-screen"
+expect = "match"
+cols = 12
+rows = 2
+after = "ls"
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007\u001B[?1049h\u001B]133;C\u0007\u001B[?1049l"
+note = "semantic_content lives on Screen.cursor upstream. 1049-enter copies the whole cursor across (Terminal.zig:4383), which semantic-alt-screen-inherits-the-cursor-state already pins, but 1049-exit calls restoreCursor (Terminal.zig:1872), which restores style, charset, origin and pending_wrap and NOT semantic_content. Promoted by the S2 wave: the state is per-Screen now and a 1049 exit is the one switch that does not carry it, so the C issued on the alt screen stays there."
+
+[[case]]
+name = "osc133-spacer-head-carries-the-cursor-semantic"
+expect = "match"
+cols = 4
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007a\u4E16"
+note = "A wide cell that cannot fit leaves a spacer head, and upstream writes it through the ordinary cell path (Terminal.zig:1411 into the write at 1565), so it takes the cursor's semantic_content. Promoted by the S2 wave: the head goes through the ordinary cell path now."
+
+[[case]]
+name = "spacer-head-carries-the-pen-not-the-erase-blank"
+expect = "match"
+cols = 4
+rows = 2
+bytes = "\u001B[1;31mabc\u4E16"
+note = "The same write seen through style instead of semantics. Upstream's spacer head takes cursor.style_id, so bold and red; ours carries only the pen's background, because it reuses the erase blank. Upstream carries a TODO saying spacers should be background-only, which is the proof they are not today. Promoted by the S2 wave alongside its semantic twin."
+
+[[case]]
+name = "ed2-at-a-prompt-scrolls-instead-of-clearing"
+expect = "match"
+cols = 10
+rows = 3
+scrollback = 50
+bytes = "a\r\nb\r\n\u001B]133;A\u0007$ \u001B[2J"
+note = "eraseDisplay(.complete) checks the bottom active row for a prompt mark and, on the primary screen, runs scrollClear() first (Terminal.zig:3310-3336) -- the clear-at-a-prompt behaviour that keeps history. Promoted by the S2 wave: scroll_clear_at_prompt gates on the bottom row's mark and Screen::scroll_clear mirrors both the row count and cursorReload."
+
+[[case]]
+name = "ed3-clears-the-scrollback"
+expect = "match"
+cols = 10
+rows = 2
+scrollback = 50
+bytes = "l1\r\nl2\r\nl3\r\nl4\u001B[3J"
+note = "EraseDisplay.scrollback = 3 dispatches to eraseHistory (Terminal.zig:3398). Promoted when erase_in_display learned mode 3."
+
+[[case]]
+name = "ed3-leaves-a-pending-wrap-standing"
+expect = "match"
+cols = 4
+rows = 2
+scrollback = 50
+bytes = "abcd\u001B[3JX"
+note = "Modes 0, 1 and 2 each clear the phantom state; mode 3 dispatches straight to eraseHistory and never touches it (Terminal.zig:3398). So X must still wrap to row 1 rather than overwrite the d. This pins the early return in erase_in_display -- clearing pending_wrap there would fail this case and nothing else."
+
+[[case]]
+name = "reflow-is-gated-on-decawm"
+expect = "match"
+cols = 10
+rows = 3
+resize = { cols = 5, rows = 3 }
+bytes = "abcdefghijklmno\u001B[?7l"
+note = "Terminal.resize passes reflow = modes.get(.wraparound) (Terminal.zig:3783), so with DECAWM off the primary takes resizeWithoutReflow and rows keep their identity, losing columns only. Promoted by the S2 wave: State::resize picks Rejoin or Truncate for the primary from the autowrap flag."
+
+[[case]]
+name = "reflow-blank-prompt-row-is-content"
+expect = "diff"
+diff_paths = ["row[0].semantic_prompt"]
+cols = 10
+rows = 4
+resize = { cols = 5, rows = 4 }
+bytes = "\u001B]133;A\u0007\u001B]133;D\u0007\u001B[2;1Hcontent"
+note = "PageList.zig:1573 keeps a blank row alive when it carries a semantic mark, with the mirror rule at 2327. reflow.rs defers it as a blank and re-emits it via blank_row() with a default RowMeta, so the mark is lost even when the row survives. The D stops the row below being marked a continuation."
+
+[[case]]
+name = "reflow-saved-cursor-resolves-its-pending-wrap"
+expect = "diff"
+diff_paths = ["cell[0,10].text", "cell[1,0].text", "cursor.x", "cursor.y"]
+cols = 10
+rows = 3
+resize = { cols = 20, rows = 3 }
+after = "\u001B8Q"
+bytes = "abcdefghij\u001B7"
+note = "Screen.zig:2094 resolves a saved cursor's deferred wrap after the reflow. The live cursor keeps its wrap verbatim, which reflow-write-through-the-cursor-widened pins; the saved one does not. resize.rs copies pending_wrap unchanged, so DECRC restores a wrap upstream had already resolved."
+
+[[case]]
+name = "resize-rows-only-keeps-custom-tab-stops"
+expect = "match"
+cols = 20
+rows = 4
+resize = { cols = 20, rows = 2 }
+after = "\tX"
+bytes = "\u001B[4G\u001BH\u001B[1;1H"
+note = "Terminal.zig:3766 rebuilds the tabstop table only when the column count changes, so a rows-only resize preserves HTS stops. Promoted by the S2 wave: the rebuild is guarded on the column count now. Also the corpus's first HTS and HT of any kind."
+
+[[case]]
+name = "tab-at-the-last-column-keeps-the-pending-wrap"
+expect = "match"
+cols = 5
+rows = 3
+bytes = "abcde\tZ"
+note = "horizontalTab (Terminal.zig:2111) is a bare cursorRight loop bounded by the scrolling region and never touches pending_wrap; at the last column it does nothing at all. Promoted by the S2 wave: tab_forward no longer touches pending_wrap, so Z wraps exactly as upstream does."
+
+[[case]]
+name = "cursor-up-clamps-at-the-scroll-region-top"
+expect = "match"
+cols = 10
+rows = 6
+bytes = "\u001B[3;5r\u001B[6;1H\u001B[10AX"
+note = "cursorUp caps the move at y - scrolling_region.top when the cursor is at or below the top margin (Terminal.zig:1703), so CUU cannot leave the region from below it. Promoted when terminal.rs gained cursor_up; a cursor ABOVE the region is bounded by the screen instead, which is the branch a naive clamp gets wrong."
+
+[[case]]
+name = "cursor-down-clamps-at-the-scroll-region-bottom"
+expect = "match"
+cols = 10
+rows = 6
+bytes = "\u001B[2;4r\u001B[1;1H\u001B[10BX"
+note = "The mirror rule: cursorDown caps at scrolling_region.bottom - y (Terminal.zig:1721). Promoted with its CUU twin."
+
+[[case]]
+name = "cnl-clamps-at-the-scroll-region-bottom"
+expect = "match"
+cols = 10
+rows = 6
+bytes = "\u001B[2;4r\u001B[1;1H\u001B[10EX"
+note = "CNL is cursor_down followed by carriage_return (stream.zig:1224), so it inherits the same margin clamp. This case is why the fix covers four call sites and not two: it DIFFed before the fix and matched after, measured both ways."
+
+[[case]]
+name = "cpl-clamps-at-the-scroll-region-top"
+expect = "match"
+cols = 10
+rows = 6
+bytes = "\u001B[3;5r\u001B[6;1H\u001B[10FX"
+note = "CPL is cursor_up followed by carriage_return (stream.zig:1247). The cursor starts below the region, so the clamp is y - top rather than the top of the screen."
+
+[[case]]
+name = "decrc-without-decsc-homes-and-resets-the-pen"
+expect = "match"
+cols = 10
+rows = 3
+bytes = "\u001B[2;5H\u001B[31m\u001B8X"
+note = "restoreCursor falls back to a synthetic default cursor when nothing was saved (Terminal.zig:1872), so DECRC with no DECSC is a home plus a pen reset rather than a no-op. Promoted by the S2 wave: restore_cursor substitutes the default SavedCursor and the pen falls back to Style::DEFAULT."
+
+[[case]]
+name = "decrc-restores-origin-mode"
+expect = "diff"
+diff_paths = ["cell[0,0].text", "cell[1,0].text", "cursor.y"]
+cols = 10
+rows = 6
+bytes = "\u001B[2;4r\u001B[?6h\u001B7\u001B[?6l\u001B8\u001B[1;1HX"
+note = "saveCursor stores the origin mode (Terminal.zig:1856) and restoreCursor sets it back. SavedCursor here holds only x, y and pending_wrap, so CUP 1;1 lands on the top margin upstream and on row 0 here."
+
+[[case]]
+name = "alt-screen-47-neither-clears-nor-strands-the-cursor"
+expect = "match"
+cols = 10
+rows = 3
+after = "Z"
+bytes = "\u001B[?47habc\u001B[?47l\u001B[?47h"
+note = "switchScreenMode never erases for 47, and 47 and 1047 copy the cursor in both directions (Terminal.zig:4349-4360). Promoted by the S2 wave: the mode split is explicit now and 47 neither clears nor loses the cursor."
+
+[[case]]
+name = "alt-screen-1049h-twice-clears-again"
+expect = "match"
+cols = 10
+rows = 3
+after = "Z"
+bytes = "\u001B[?1049habc\u001B[?1049h"
+note = "1049 saves the cursor unconditionally on enable and its eraseDisplay sits outside the screen-changed guard (Terminal.zig:4372-4395), so a second 1049h re-clears. Promoted by the S2 wave: both now sit outside the changed guard here too."
+
+[[case]]
+name = "alt-screen-1049l-on-the-primary-still-restores"
+expect = "match"
+cols = 10
+rows = 3
+after = "X"
+bytes = "\u001B[2;5H\u001B7\u001B[1;1H\u001B[?1049l"
+note = "The disable arm calls restoreCursor whether or not the screen changed (Terminal.zig:4395), so 1049l on the primary is a DECRC. Also the corpus's first 1049l. Promoted by the S2 wave: the restore is unconditional here too."
+
+[[case]]
+name = "scroll-region-is-shared-with-the-alternate-screen"
+expect = "match"
+cols = 10
+rows = 5
+after = "a\r\nb\r\nc\r\nd"
+bytes = "\u001B[2;3r\u001B[?1049h"
+note = "Ghostty keeps one Terminal.scrolling_region for both screens and switchScreenMode never touches it (Terminal.zig:67). Promoted by the S2 wave: the region is carried across the switch, so DECSTBM set on the primary governs the alternate too."
+
+[[case]]
+name = "scroll-region-set-in-the-alternate-survives-the-exit"
+expect = "match"
+cols = 10
+rows = 5
+after = "a\r\nb\r\nc\r\nd"
+bytes = "\u001B[?1049h\u001B[2;3r\u001B[?1049l"
+note = "The other direction of the shared scrolling_region: DECSTBM issued while in the alternate screen still governs the primary after mode 1049 exits, because upstream's region lives on the Terminal, not the screen. Added as diff by the S2 wave and promoted by the same fix that carried the region across the switch."
+
+[[case]]
+name = "semantic-fresh-line-at-the-last-row-scrolls"
+expect = "match"
+cols = 12
+rows = 3
+scrollback = 50
+bytes = "a\r\nb\r\nxy\u001B]133;A\u0007$ "
+note = "A's fresh line taken on the bottom row scrolls the screen, so the row that gets the prompt mark is the new bottom row and the old top row reaches history. index()'s continuation rule fires first and start_prompt overwrites it, in both implementations. A pin, not a hunt."
+
+[[case]]
+name = "semantic-inside-a-scroll-region"
+expect = "match"
+cols = 12
+rows = 5
+scrollback = 50
+bytes = "\u001B[2;4r\u001B[4;1Hxy\u001B]133;A\u0007$ \u001B]133;B\u0007ls"
+note = "The fresh line is taken at the bottom margin of a region that does not start at row 0, so the row pushed out never leaves the screen and must not become history, while the prompt mark still lands on the new bottom row of the region. Two rules crossing that no existing case crosses."
+
+[[case]]
+name = "mode-2004-bracketed-paste"
+expect = "match"
+bytes = "\u001B[?2004h"
+note = "Bracketed paste leaves no trace on the grid; the mode itself is the observable, read from the oracle via ghostty_terminal_mode_get. Went in as diff before the core tracked the mode and was promoted by the implementation."
+
+[[case]]
+name = "mode-2004-set-then-reset"
+expect = "match"
+bytes = "\u001B[?2004h\u001B[?2004l"
+note = "Set and reset cancel: both sides report the mode off. Trivially green before the core tracks 2004; afterwards it pins the reset path."
+
+[[case]]
+name = "mode-2004-survives-the-alt-screen"
+expect = "match"
+bytes = "\u001B[?2004h\u001B[?1049h"
+note = "The mode is terminal-global: entering the alternate screen does not clear it. Measured as a diff first; the promotion pins that the state lives on the terminal, not the screen."
+
+[[case]]
+name = "mode-2004-reset-by-ris"
+expect = "match"
+bytes = "\u001B[?2004h\u001Bc"
+note = "RIS resets the mode with everything else. Trivially green before the core tracks 2004; afterwards it guards full_reset."
+
+[[case]]
+name = "osc133-d-carries-an-exit-status"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "\u001B]133;A\u0007$ \u001B]133;B\u0007ls\r\n\u001B]133;C\u0007out\r\n\u001B]133;D;0\u0007\u001B]133;A\u0007$ "
+note = "The dialect every real integration emits (Ghostty's own and iTerm2's): D closes the command with its exit status as an option. Added by the S2 compat wave 2026-07-30 to pin that an optioned D is accepted, not dropped as garbage."
+
+[[case]]
+name = "osc133-a-with-options-still-starts-a-prompt"
+expect = "match"
+cols = 12
+rows = 3
+bytes = "xy\u001B]133;A;cl=line\u0007$ "
+note = "Ghostty's zsh integration emits A with cl=line. The option must not invalidate the action: the fresh line and the prompt mark both still happen. Added by the S2 compat wave 2026-07-30."
+
+[[case]]
+name = "vs16-cluster-stays-narrow"
+expect = "match"
+cols = 8
+rows = 2
+bytes = "a\u2764\uFE0Fb"
+note = "MEASURED 2026-07-30: upstream keeps a VS16 emoji-presentation cluster at width 1 -- b lands in column 2 and the grids agree exactly. Pinned so the renderer-side emoji-presentation work (which draws the color glyph in that single cell) can never leak a width change into the core."
+
+[[case]]
+name = "decstr-soft-reset-diverges"
+expect = "diff"
+diff_paths = ["cell[1,0].style", "cursor.style"]
+bytes = "\u001B[2;5r\u001B[?6h\u001B[31m\u001B[!pX"
+note = "DECSTR (CSI ! p). The oracle has no ! intermediate dispatch at all (v1.3.2), so it keeps DECOM, the region and the red pen; this core soft-resets them, xterm's way -- esctest2 sends DECSTR before every test, and ignoring it makes every result order-dependent. Deliberate divergence where the oracle is silent, the sixel precedent."
+
+[[case]]
+name = "mouse-9-x10-tracking"
+expect = "match"
+bytes = "\u001B[?9h"
+note = "X10 mouse reporting. The raw bit is the observable (ghostty_terminal_mode_get); reports themselves are host output the differential cannot see. Went in as diff before the core routed the family and was promoted by the implementation."
+
+[[case]]
+name = "mouse-1000-normal-tracking"
+expect = "match"
+bytes = "\u001B[?1000h"
+note = "Normal tracking (press+release). Went in as diff before the core routed the family and was promoted by the implementation."
+
+[[case]]
+name = "mouse-1002-button-tracking"
+expect = "match"
+bytes = "\u001B[?1002h"
+note = "Button-event tracking (adds drag motion). Went in as diff before the core routed the family and was promoted by the implementation."
+
+[[case]]
+name = "mouse-1003-any-tracking"
+expect = "match"
+bytes = "\u001B[?1003h"
+note = "Any-event tracking (motion without buttons). Went in as diff before the core routed the family and was promoted by the implementation."
+
+[[case]]
+name = "mouse-1005-utf8-format"
+expect = "match"
+bytes = "\u001B[?1005h"
+note = "UTF-8 coordinate format. Went in as diff before the core routed the family and was promoted by the implementation."
+
+[[case]]
+name = "mouse-1006-sgr-format"
+expect = "match"
+bytes = "\u001B[?1006h"
+note = "SGR format, the one every modern TUI asks for. Went in as diff before the core routed the family and was promoted by the implementation."
+
+[[case]]
+name = "mouse-1015-urxvt-format"
+expect = "match"
+bytes = "\u001B[?1015h"
+note = "urxvt decimal format. Went in as diff before the core routed the family and was promoted by the implementation."
+
+[[case]]
+name = "mouse-1016-sgr-pixels-format"
+expect = "match"
+bytes = "\u001B[?1016h"
+note = "SGR-Pixels format. Went in as diff before the core routed the family and was promoted by the implementation."
+
+[[case]]
+name = "mouse-raw-bits-are-independent"
+expect = "match"
+bytes = "\u001B[?1000h\u001B[?1002h\u001B[?1002l"
+note = "The trap this family carries: the oracle records every mode's RAW bit before deriving its last-writer event kind (stream_terminal.zig setMode), so after 1000h 1002h 1002l the 1000 bit is STILL SET (DECRQM answers 1) even though the derived kind dropped to none and reporting is off. A core that stores only the-current-mode answers this wrong; went in as diff, promoted by the raw-bit implementation."
+
+[[case]]
+name = "mouse-1007-alternate-scroll-default-on"
+expect = "match"
+bytes = "\u001B[?1007l"
+note = "Alternate scroll is the one mouse mode that DEFAULTS ON (modes.zig marks it .default = true). The 1007l pins BOTH halves at once: the shared on-default (a wrong candidate default would add a second path on every other mouse case) and the reset direction, measured 2026-07-30 as oracle=false candidate=true before the core routed 1007, then promoted by the implementation."
+
+[[case]]
+name = "mouse-1007-restored-by-ris"
+expect = "match"
+bytes = "\u001B[?1007l\u001Bc"
+note = "RIS returns modes to their DEFAULTS, not to false: 1007 comes back ON after a reset. Green while both sides default on; guards full_reset once the core routes 1007."
+
+[[case]]
+name = "mouse-modes-survive-the-alt-screen"
+expect = "match"
+bytes = "\u001B[?1000h\u001B[?1006h\u001B[?1049h"
+note = "Mouse modes are terminal-global like 2004: entering the alternate screen keeps them. vim enables 1000/1006 and then 1049h -- clearing on the switch would kill its mouse support exactly when it starts. Went in as diff, promoted by the implementation."
+
+[[case]]
+name = "sync-2026-tracked"
+expect = "match"
+bytes = "\u001B[?2026hbatch"
+note = "Synchronized output (mode 2026) is tracked state both sides report through ghostty_terminal_mode_get; the BATCHING itself is the pump's publish gate, outside the core by design."
+
+[[case]]
+name = "sync-2026-cleared-by-resize"
+expect = "match"
+cols = 10
+rows = 4
+resize = { cols = 12, rows = 4 }
+bytes = "\u001B[?2026hx"
+note = "MEASURED 2026-07-30: the oracle clears 2026 on resize (its own test pins even the unchanged-dimensions direction); a program holding the gate across a resize would freeze the redraw the user just asked for."
+
+[[case]]
+name = "sync-2026-survives-alt-switch"
+expect = "match"
+bytes = "\u001B[?2026h\u001B[?1049halt"
+note = "2026 is terminal-global like 2004: entering the alternate screen keeps the batch open."
+
+[[case]]
+name = "mode-1-decckm-tracked"
+expect = "match"
+bytes = "\u001B[?1h"
+note = "DECCKM (application cursor keys). Tracked because the host arrow and alternate-scroll paths pick ESC O over ESC [ by it; the raw bit is the observable via ghostty_terminal_mode_get. Added with the SGR mouse slice 2026-07-30."
+
+[[case]]
+name = "mode-1-decckm-across-decstr"
+expect = "diff"
+diff_paths = ["modes.cursor_keys"]
+bytes = "\u001B[?1h\u001B[!p"
+note = "The DECSTR divergence seen through DECCKM: the oracle has no ! dispatch so it keeps mode 1 set; this core soft-resets it, xterm way (xterm DECSTR resets DECCKM). Same deliberate divergence as decstr-soft-reset-diverges, pinned on the one mode the wheel routing reads."
+
+[[case]]
+name = "mode-66-keypad-application"
+expect = "match"
+bytes = "\u001B[?66h"
+note = "DECKPAM via the CSI spelling. Tracked for the host key encoder; observable through ghostty_terminal_mode_get. Added with the kitty keyboard slice 2026-07-30 -- routing landed with the harness, so the comparator control (each_mouse_mode_bit_disagreement...) is the discriminating guard for the comparison itself."
+
+[[case]]
+name = "mode-66-esc-equals-spelling"
+expect = "match"
+bytes = "\u001B="
+note = "DECKPAM via ESC =. The oracle routes it through the same mode-66 table entry as CSI ?66h (stream.zig emits set_mode), so mode_get observes both spellings identically -- this pins that our ESC dispatch does too."
+
+[[case]]
+name = "mode-1035-default-on"
+expect = "match"
+bytes = "\u001B[?1035l"
+note = "ignore_keypad_with_numlock DEFAULTS ON (modes.zig .default = true); the 1035l pins the shared default and the reset direction at once, the 1007 pattern."
+
+[[case]]
+name = "mode-1036-default-on"
+expect = "match"
+bytes = "\u001B[?1036l"
+note = "alt_esc_prefix DEFAULTS ON; same shape as 1035."
+
+[[case]]
+name = "mode-66-keypad-across-decstr"
+expect = "diff"
+diff_paths = ["modes.keypad_keys"]
+bytes = "\u001B=\u001B[!p"
+note = "The DECSTR divergence seen through the keypad: the oracle has no ! dispatch and keeps mode 66 set; this core soft-resets it (VT510 DECSTR table lists the keypad returning to numeric). Same deliberate divergence family as decstr-soft-reset-diverges and the DECCKM pin."
+
+[[case]]
+name = "osc7-reports-the-pwd"
+expect = "match"
+bytes = "\u001B]7;file:///Users/example/src\u001B\\"
+note = "OSC 7 working directory. Observable via GHOSTTY_TERMINAL_DATA_PWD, so unlike OSC 8 or OSC 52 this has a real oracle. Filed diff BEFORE the core tracked anything; the promotion to match is the evidence."
+
+[[case]]
+name = "osc7-bel-terminated"
+expect = "match"
+bytes = "\u001B]7;file:///tmp\u0007"
+note = "BEL is what zsh's precmd actually emits; a parser accepting only ST looks green in every test and dies on every real prompt."
+
+[[case]]
+name = "osc7-payload-is-stored-raw"
+expect = "match"
+bytes = "\u001B]7;file:///Users/example/My%20Code\u001B\\"
+note = "Percent-encoding is NOT decoded and the value is never validated (stream_terminal.zig reportPwd stores it raw). A helpful decoder diverges on every path containing a space."
+
+[[case]]
+name = "osc7-not-a-uri-is-stored-anyway"
+expect = "match"
+bytes = "\u001B]7;/plain/path\u001B\\"
+note = "The oracle validates nothing, so a bare path is stored as-is. This is the case that kills a 'reject anything without file://' implementation."
+
+[[case]]
+name = "osc7-second-report-replaces-the-first"
+expect = "match"
+bytes = "\u001B]7;file:///one\u001B\\\u001B]7;file:///two\u001B\\"
+note = "Last writer wins and there is no history. Kills an implementation that appends or keeps the first."
+
+[[case]]
+name = "osc7-survives-the-alternate-screen"
+expect = "match"
+bytes = "\u001B]7;file:///primary\u001B\\\u001B[?1049h"
+note = "The pwd lives on Terminal, not Screen, so a buffer switch cannot disturb it. Pins terminal-global storage, the same shape as modes 2004 and 2026."
+
+[[case]]
+name = "osc7-empty-clears"
+expect = "match"
+bytes = "\u001B]7;file:///tmp\u001B\\\u001B]7;\u001B\\"
+note = "An empty payload clears the pwd (Terminal.zig setPwd). Both sides read empty today so this matches vacuously; it becomes a real assertion the moment tracking lands, which is why it is pinned now rather than after."
+
+[[case]]
+name = "osc7-ris-clears"
+expect = "match"
+bytes = "\u001B]7;file:///tmp\u001B\\\u001Bc"
+note = "RIS clears the pwd (fullReset). Same shape as the empty case: vacuous today, load-bearing after the core tracks it."
+
+[[case]]
+name = "osc9-9-conemu-sets-the-pwd"
+expect = "match"
+bytes = "\u001B]9;9;/Users/example/from-conemu\u001B\\"
+note = "ConEmu CurrentDir feeds the SAME pwd as OSC 7 (measured against the oracle 2026-07-31). Pinned because before this the sequence fell through to the notification branch and popped a desktop notification reading '9;/Users/example/from-conemu'. Payload is a bare path here, not a URI; the core stores either verbatim."
+
+[[case]]
+name = "osc4-sets-an-indexed-palette-entry"
+expect = "match"
+bytes = "\u001B]4;1;#ff0000\u0007"
+note = "OSC 4 overrides palette index 1. Promoted DIFF->MATCH by the colour slice 2026-08-01."
+
+[[case]]
+name = "osc4-sets-two-entries-in-one-command"
+expect = "match"
+bytes = "\u001B]4;1;rgb:12/34/56;2;#0f0\u0007"
+note = "OSC 4 takes repeating index;spec pairs; rgb:RR/GG/BB and #RGB shorthand both parse, and #RGB scales v*255/15 (f -> 255, the oracle rule, not xterm truncation). Promoted by the colour slice."
+
+[[case]]
+name = "osc10-sets-the-dynamic-foreground"
+expect = "match"
+bytes = "\u001B]10;#20df80\u0007"
+note = "OSC 10 sets the effective foreground. Promoted by the colour slice."
+
+[[case]]
+name = "osc10-second-param-falls-through-to-osc11"
+expect = "match"
+bytes = "\u001B]10;#20df80;rgb:10/20/30\u0007"
+note = "A second OSC 10 parameter addresses the NEXT dynamic colour (xterm rule the oracle keeps). Promoted by the colour slice."
+
+[[case]]
+name = "osc11-sets-the-dynamic-background"
+expect = "match"
+bytes = "\u001B]11;rgb:1212/3434/5656\u0007"
+note = "OSC 11 sets the effective background; rgb: accepts 1-4 hex digits per channel. Promoted by the colour slice."
+
+[[case]]
+name = "osc12-sets-the-cursor-colour"
+expect = "match"
+bytes = "\u001B]12;#c0ffee\u001B\\"
+note = "OSC 12 sets the cursor colour; ST termination covered here, BEL elsewhere in the family. Promoted by the colour slice. The snapshot cursor mirrors the DATA getter (no foreground fallback; that fallback is query-reply behaviour only)."
+
+[[case]]
+name = "osc12-sets-the-cursor-colour"
+expect = "match"
+bytes = "\u001B]12;#c0ffee\u001B\\"
+note = "OSC 104;3 returns index 3 to the default table. Load-bearing since the colour slice: a core that sets without resetting diffs here."
+
+[[case]]
+name = "osc12-sets-the-cursor-colour"
+expect = "match"
+bytes = "\u001B]12;#c0ffee\u001B\\"
+note = "OSC 110 clears the OSC 10 override. Load-bearing since the colour slice, same shape as osc104-resets-an-overridden-index."
+
+[[case]]
+name = "colours-survive-a-full-reset"
+expect = "match"
+bytes = "\u001B]4;1;#ff0000\u0007\u001B]10;#20df80\u0007\u001Bc"
+note = "RIS does NOT reset colour state: the oracle's fullReset resets modes, tabs, pwd, title and screens and never touches colors, so the palette override and the dynamic foreground ride through. Counterintuitive enough that a plausible implementation resets them; this pin is what catches that."
+
+[[case]]
+name = "osc4-error-stops-the-list-but-keeps-the-prefix"
+expect = "match"
+bytes = "\u001B]4;1;#ff0000;notanumber;#00ff00;2;#0000ff\u0007"
+note = "xterm's ChangeAnsiColorRequest rule, kept by the oracle: an unparseable index stops the whole list, keeping what parsed before it. Index 1 turns red; index 2 must NOT turn blue."
+
+[[case]]
+name = "decfra-fills-diverging-from-the-oracle"
+expect = "diff"
+diff_paths = ["cell[0,0].text", "cell[0,1].text", "cell[1,0].text", "cell[1,1].text"]
+bytes = "\u001B[37;1;1;2;2$x"
+note = "DECFRA fills a rect with '%'. The oracle has NO dollar-intermediate grid ops (measured 2026-08-01: no $x/$z/$v dispatch in stream_terminal.zig), so this is a deliberate divergence in xterm's direction - the DECSTR pattern. esctest asserts the xterm behaviour."
+
+[[case]]
+name = "decera-erases-diverging-from-the-oracle"
+expect = "diff"
+diff_paths = ["cell[0,0].text", "cell[0,1].text", "cell[1,0].text", "cell[1,1].text"]
+bytes = "ab\r\ncd\u001B[1;1;2;2$z"
+note = "DECERA blanks the rect; the oracle ignores the sequence and keeps ab/cd. Same deliberate xterm-direction divergence as DECFRA."
+
+[[case]]
+name = "deccra-copies-diverging-from-the-oracle"
+expect = "diff"
+diff_paths = ["cell[1,0].text", "cell[1,1].text"]
+bytes = "ab\u001B[1;1;1;2;1;2;1;1$v"
+note = "DECCRA copies row 1's 'ab' onto row 2; the oracle ignores it. Same deliberate xterm-direction divergence family."
+
+[[case]]
+name = "ansi-modes-track-like-the-oracle"
+expect = "match"
+bytes = "\u001B[2h\u001B[4h\u001B[20h\u001B[12l"
+note = "SM sets KAM/IRM/LNM and RM clears SRM - the oracle's exact ANSI mode set, compared as state on every case since the DECRQM slice."
+
+[[case]]
+name = "lnm-linefeed-returns-the-carriage"
+expect = "match"
+bytes = "abc\u001B[20h\ndef"
+note = "With LNM set, LF also does CR (the oracle's linefeed(): index then carriageReturn), so 'def' starts at column 0 of the next row rather than column 3."
+
+[[case]]
+name = "reverse-video-and-backarrow-track"
+expect = "match"
+bytes = "\u001B[?5h\u001B[?67h\u001B[?4h"
+note = "DECSCNM, DECBKM and DECSCLM are tracked state in the oracle's table; consumers live outside the core."
+
+[[case]]
+name = "ansi-modes-survive-nothing-special-but-ris-resets-them"
+expect = "match"
+bytes = "\u001B[4h\u001B[?5h\u001Bc"
+note = "RIS returns every tracked mode to its default (modes.reset() in fullReset) - insert off, reverse video off, SRM back to SET."
+
+[[case]]
+name = "decsca-protected-cells-survive-decsed"
+expect = "match"
+bytes = "\u001B[1\"qabc\u001B[0\"qX\u001B[1;1H\u001B[?0J"
+note = "DECSCA-protected abc survives DECSED while the unprotected X goes - both sides implement the DEC protection matrix (the oracle's eraseDisplay takes protected_req)."
+
+[[case]]
+name = "iso-protection-guards-even-plain-erases"
+expect = "match"
+bytes = "\u001BVab\u001BWcd\u001B[1;1H\u001B[0J"
+note = "SPA/EPA: with ISO as the most recent protection mode, even the PLAIN erases spare protected cells - the oracle's protected_mode == .iso arm. ab survives a bare ED."
+
+[[case]]
+name = "decsc-carries-the-protection-pen"
+expect = "match"
+bytes = "\u001B[1\"qa\u001B7\u001B[0\"qb\u001B8c\u001B[1;1H\u001B[?0J"
+note = "DECSC saves the protection pen and DECRC restores it: c prints protected again after the restore, so a and c survive the selective erase and b does not."
+
+[[case]]
+name = "ech-respects-iso-protection-only"
+expect = "match"
+bytes = "\u001BVab\u001BWcd\u001B[1;1H\u001B[4X"
+note = "ECH consults the most recent protection mode (the oracle's eraseChars comment is the whole reason the mode is never reset to off): under ISO it spares ab."
+
+[[case]]
+name = "decsera-respects-protection-diverging"
+expect = "diff"
+diff_paths = ["cell[0,0].text", "cell[0,2].text"]
+bytes = "a\u001B[1\"qb\u001B[0\"qc\u001B[1;1;1;8${"
+note = "DECSERA blanks the unprotected a and c and spares the protected b; the oracle has no dollar-intermediate rect ops, keeps all three. Same divergence family as DECFRA/DECERA/DECCRA."
+
+[[case]]
+name = "decsed-erases-iso-protected-diverging"
+expect = "diff"
+diff_paths = ["cell[0,1].text"]
+bytes = "a\u001BVb\u001BW\u001B[1;1H\u001B[?2J"
+note = "The one seam where the two protection models split: DECSED on an ISO-protected cell. xterm (and esctest's DECSED_doesNotRespectISOProtect) ERASE it - selective erases spare only DECSCA cells - while the oracle's protected = iso_or_requested spares it. This core takes xterm's side deliberately: the oracle's model leaks an ISO cell through esctest's own between-test ED(2), making the whole suite order-dependent, the same disease its missing DECSTR causes. Divergence class: DECSTR pattern."
+
+[[case]]
+name = "probe-iso-protection-against-complete-erase"
+expect = "match"
+bytes = "a\u001BVb\u001BW\u001B[1;1H\u001B[2J"
+note = "MEASURED: a complete erase (ED 2) DOES spare an ISO-protected cell, on both sides. Kept as a pin because it is the fact that forced DECSTR to strip protection - without that, esctest carries a protected cell across its own between-test reset."
+
+[[case]]
+name = "osc2-sets-the-window-title"
+expect = "match"
+bytes = "\u001B]2;hello world\u0007"
+note = "OSC 2 sets the window title, a real differential observable (the oracle answers GHOSTTY_TERMINAL_DATA_TITLE). Before the winops slice the core raised a Title EVENT and stored nothing, so a snapshot could not see it at all."
+
+[[case]]
+name = "osc1-sets-only-the-icon-title"
+expect = "match"
+bytes = "\u001B]2;window\u0007\u001B]1;icon\u0007"
+note = "OSC 1 addresses the ICON title only, so the window title must survive it. The oracle has no icon title, which is exactly why this case is worth pinning: a core that let OSC 1 overwrite the window title would diverge HERE and nowhere else."
+
+[[case]]
+name = "ris-clears-the-title"
+expect = "match"
+bytes = "\u001B]2;doomed\u0007\u001Bc"
+note = "RIS clears the title (the oracle's fullReset clears its title buffer)."
+
+[[case]]
+name = "declrmm-decslrm-sets-margins-and-homes"
+expect = "match"
+bytes = "\u001B[?69h\u001B[3;6s"
+note = "DECSLRM under mode 69 sets the column band and HOMES the cursor (setCursorPos(1,1)). Both sides implement left/right margins - the oracle carries scrolling_region.left/right - so this whole family is differentially measurable, not source-referenced."
+
+[[case]]
+name = "decslrm-is-refused-without-mode-69"
+expect = "match"
+bytes = "\u001B[3;6s"
+note = "Without DECLRMM, CSI s is SCOSC (save cursor) and sets no margins - the ambiguity the oracle resolves in its handler rather than its parser. A core that always parsed DECSLRM would move the cursor here and diverge."
+
+[[case]]
+name = "carriage-return-lands-on-the-left-margin"
+expect = "match"
+bytes = "\u001B[?69h\u001B[3;6s\u001B[1;5Habc\r X"
+note = "CR returns to the LEFT MARGIN, not column 0, when the cursor is at or right of it (Terminal.zig:1676)."
+
+[[case]]
+name = "carriage-return-left-of-the-margin-goes-to-column-zero"
+expect = "match"
+bytes = "\u001B[?69h\u001B[3;6s\u001B[1;2Hab\rZ"
+note = "The arm a plausible implementation misses: a cursor LEFT of the margin gets a real carriage return to column 0, which is what lets a program write outside the band."
+
+[[case]]
+name = "backspace-crosses-the-left-margin"
+expect = "match"
+bytes = "\u001B[?69h\u001B[3;6s\u001B[1;3H\b\b\bX"
+note = "MEASURED, against my own wrong assumption: BS and CUB clamp at COLUMN 0 and ignore the left margin. The oracle cursorLeft takes a fast path when no reverse-wrap mode is active (Terminal.zig:1766) and its margin-aware floor is reachable only through the reverse-wrap walk, which mode 45 gates and neither side implements. CUF still stops at the RIGHT margin, so the pair is genuinely asymmetric. This case failed first with the cursor three columns off, which is how the rule got found rather than guessed."
+
+[[case]]
+name = "cuf-stops-at-the-right-margin"
+expect = "match"
+bytes = "\u001B[?69h\u001B[3;6s\u001B[1;3H\u001B[20CX"
+note = "CUF clamps to the right margin while the cursor is at or left of it (Terminal.zig:1743)."
+
+[[case]]
+name = "printing-wraps-at-the-right-margin"
+expect = "match"
+bytes = "\u001B[?69h\u001B[2;5s\u001B[1;2Habcdefgh"
+note = "Printing wraps at the RIGHT MARGIN and the wrap lands on the LEFT MARGIN (printWrap ends with cursorHorizontalAbsolute(left)), so the text stays inside the column band across rows."
+
+[[case]]
+name = "ich-and-dch-stay-inside-the-band"
+expect = "match"
+bytes = "\u001B[?69h\u001B[2;5s\u001B[1;1Habcdefgh\u001B[1;2H\u001B[2@\u001B[2;1Hijklmnop\u001B[2;2H\u001B[2P"
+note = "ICH pushes cells off the RIGHT MARGIN rather than past it, and DCH pulls from inside the band - so neither smears into text parked outside the margins."
+
+[[case]]
+name = "scrolling-only-moves-the-column-band"
+expect = "match"
+bytes = "\u001B[?69h\u001B[3;6s\u001B[1;1Habcdefgh\r\nijklmnop\u001B[1;3H\u001B[1M"
+note = "DL scrolls only the banded columns: cells outside the margins hold still, which is the entire point of a column band."
+
+[[case]]
+name = "mode-40-is-pure-stored-state"
+expect = "match"
+bytes = "\u001B[?40h"
+note = "DECSET 40 (Allow80To132) stores the bit and does nothing else - the oracle's setMode arm is literally empty (stream_terminal.zig: .enable_mode_3 => {}). The bit is the whole observable."
+
+[[case]]
+name = "deccolm-is-inert-without-mode-40"
+expect = "match"
+bytes = "ab\u001B[?3h"
+note = "DECSET 3 without mode 40 is fully ignored: deccolm (Terminal.zig:3644) forces 132_column FALSE and returns before touching the grid. Content survives, width stays, cursor stays. The gate direction of the DECCOLM family."
+
+[[case]]
+name = "deccolm-132-resizes-erases-and-homes"
+expect = "match"
+bytes = "\u001B[5;5Hxyz\u001B[?40h\u001B[?3h"
+note = "With mode 40 armed, DECSET 3 is the full VT sequence: resize to 132 columns, erase the display completely, home the cursor (deccolm: resize, eraseDisplay(.complete), setCursorPos(1,1)). Grid width, content, cursor and the mode bit all move at once."
+
+[[case]]
+name = "deccolm-back-to-80-erases-again"
+expect = "match"
+bytes = "\u001B[?40h\u001B[?3habc\u001B[?3l"
+note = "DECRST 3 with the grant is deccolm(80_cols): the same resize-erase-home, pointed the other way. Content printed in 132-column mode does not survive the return trip."
+
+[[case]]
+name = "deccolm-resets-margins-and-scroll-region"
+expect = "match"
+bytes = "\u001B[?40h\u001B[?69h\u001B[3;6s\u001B[?3hab\rX"
+note = "deccolm calls resize, and resize resets the scrolling region on ALL FOUR edges (Terminal.zig resize tail). After DECCOLM the CR lands on column 0, not the old left margin - the discriminating cell for a core that resized without clearing the band."
+
+[[case]]
+name = "deccolm-set-without-grant-forces-the-bit-off"
+expect = "match"
+bytes = "\u001B[?40h\u001B[?3h\u001B[?40l\u001B[?3h"
+note = "Adversarial edge measured off the oracle's order of operations: setMode stores 132_column=true unconditionally, THEN deccolm sees mode 40 off and forces it back FALSE without resizing. So a SET of mode 3 after the grant is revoked turns the bit OFF while the grid stays 132 wide. A core that gates the store but skips the force-false diverges here."
+
+[[case]]
+name = "ris-clears-deccolm-state-but-keeps-the-width"
+expect = "match"
+bytes = "\u001B[?40h\u001B[?3h\u001Bc"
+note = "fullReset (Terminal.zig:4459) resets the mode table - modes 3 and 40 both drop - but performs NO resize, so the grid stays 132 columns wide after RIS. xterm resizes back to 80 here and esctest asserts that; we follow the oracle and lose test_RIS_ResetDECCOLM on the width half, deliberately."
+
+# ---------------------------------------------------------------------------
+# D2 SELECTION. These are the first cases in the corpus that ask a QUESTION rather
+# than only writing bytes: `select` derives a range from a point after the stream has
+# run. libghostty-vt answers through ghostty_terminal_select_word/line/all plus its
+# formatter, so word boundaries, line trimming and the clipboard text are all measured
+# against the real thing instead of agreed with ourselves.
+#
+# Every one of them is `diff` today because `Terminal::select` reports "no selectable
+# content" for everything. That is the harness being shown to SEE selection before a
+# line of it is written - the failure these produce when selection lands is the feature,
+# and each gets promoted to `match` then.
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "select-word-in-the-middle"
+expect = "match"
+bytes = "hello world"
+select = [{ kind = "word", x = 2, y = 0 }]
+note = "The simplest word selection there is: a point inside 'hello' selects 'hello' and not the line."
+
+[[case]]
+name = "select-word-at-its-last-cell"
+expect = "match"
+bytes = "hello world"
+select = [{ kind = "word", x = 4, y = 0 }]
+note = "The boundary cell belongs to the word. An off-by-one in the forward scan stops one short here and nowhere else."
+
+[[case]]
+name = "select-word-on-the-space-between-words"
+expect = "match"
+bytes = "hello world"
+select = [{ kind = "word", x = 5, y = 0 }]
+note = "Whitespace is its own run in Ghostty's rules, not a boundary that snaps to a neighbour. Measured rather than assumed - a plausible implementation returns the word to the left."
+
+[[case]]
+name = "select-word-across-punctuation"
+expect = "match"
+bytes = "foo.bar baz"
+select = [{ kind = "word", x = 1, y = 0 }]
+note = "Whether '.' bounds a word is a boundary-codepoint question with a real answer in the oracle, and it is the difference between selecting a filename and selecting its stem."
+
+[[case]]
+name = "select-word-on-a-blank-cell"
+expect = "match"
+bytes = "hi"
+select = [{ kind = "word", x = 10, y = 0 }]
+note = "MEASURED: past the text the oracle answers NO_VALUE - a blank cell has no word. Passing today only because the candidate answers nothing for everything, so it is a pin on the oracle rather than proof about us; when selection lands it becomes the case that stops a word scan from selecting a run of blanks."
+
+[[case]]
+name = "select-word-hebrew"
+expect = "match"
+bytes = "שלום עולם"
+select = [{ kind = "word", x = 1, y = 0 }]
+note = "The word rules must not be ASCII-only. Selection is logical, never visual - the range is in grid order and reordering is the renderer's business."
+
+[[case]]
+name = "select-word-wide-cell"
+expect = "match"
+bytes = "你好 world"
+select = [{ kind = "word", x = 1, y = 0 }]
+note = "MEASURED, not assumed: x=1 is the spacer tail of a wide cell and the oracle answers NO_VALUE there - a spacer tail has no word. Passing today only because the candidate answers nothing for everything; once selection lands this case demands it keeps answering nothing HERE, which is the half a word implementation gets wrong by scanning cells rather than clusters."
+
+[[case]]
+name = "select-line-simple"
+expect = "match"
+bytes = "hello world"
+select = [{ kind = "line", x = 3, y = 0 }]
+note = "A line selection covers the whole line whatever column it is asked from, trimmed of trailing blanks."
+
+[[case]]
+name = "select-line-with-trailing-blanks"
+expect = "match"
+bytes = "abc   "
+select = [{ kind = "line", x = 0, y = 0 }]
+note = "Trailing whitespace is trimmed by the line rules AND by the formatter. Two independent trims, and a range that keeps them while the text drops them is a real disagreement this case can see."
+
+[[case]]
+name = "select-line-across-a-soft-wrap"
+expect = "match"
+cols = 10
+bytes = "abcdefghijklmno"
+select = [{ kind = "line", x = 2, y = 1 }]
+note = "One logical line spanning two rows. Asked from the continuation row, the selection must reach back to the row that started it - the case a row-shaped implementation gets wrong."
+
+[[case]]
+name = "select-line-on-the-second-of-two-hard-lines"
+expect = "match"
+bytes = "one\r\ntwo"
+select = [{ kind = "line", x = 1, y = 1 }]
+note = "The mirror of the soft-wrap case: a hard line break really is a boundary, so a line selection must NOT reach back. An implementation that always joins upward passes the previous case and fails this one."
+
+[[case]]
+name = "select-all-two-lines"
+expect = "match"
+bytes = "one\r\ntwo"
+select = [{ kind = "all", x = 0, y = 0 }]
+note = "Select-all covers every selectable cell, which is not the same as every cell: the blank rows below the text are the question."
+
+[[case]]
+name = "select-all-with-scrollback"
+expect = "match"
+rows = 2
+scrollback = 100
+bytes = "one\r\ntwo\r\nthree\r\nfour"
+select = [{ kind = "all", x = 0, y = 0 }]
+note = "Whether select-all reaches into history is the whole question for a terminal with scrollback, and it decides what cmd+A gives the operator."
+
+[[case]]
+name = "two-probes-on-one-grid"
+expect = "match"
+bytes = "alpha beta"
+select = [{ kind = "word", x = 0, y = 0 }, { kind = "word", x = 7, y = 0 }]
+note = "Two probes against one grid, so the probe list is proven to be a list rather than a single hidden slot - and the paths carry their index."
+
+[[case]]
+name = "select-word-with-scrollback-above"
+expect = "match"
+rows = 2
+scrollback = 100
+bytes = "one\r\ntwo\r\nthree\r\nfour"
+select = [{ kind = "word", x = 1, y = 0 }]
+note = "The coordinate seam, and nothing else in the corpus could see it: the probe point is ACTIVE-relative (row 0 of a two-row screen) while the range comes back ABSOLUTE, counting the two rows that scrolled into history. A candidate that forgets the offset reports a word from the wrong line entirely and looks perfectly correct on every case with no scrollback - which is every other selection case here."
+
+[[case]]
+name = "select-word-filling-a-whole-row"
+expect = "match"
+cols = 5
+bytes = "abcde"
+select = [{ kind = "word", x = 1, y = 0 }]
+note = "The word ends exactly at the last column of a row that does not soft-wrap. That cell BELONGS to the word, and it is the one place the forward scan takes its inclusive branch - a scan that returns the previous cell there loses the last character of every word that fills a line, and every other case in this corpus stays green. Added after a mutant with that exact shape survived the whole corpus."

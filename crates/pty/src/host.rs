@@ -1,0 +1,763 @@
+//! Purpose: own a pseudoterminal and a child process, and turn their output into frames.
+//! Public surface: `Host`, `Options`, `Geometry`, `SpawnError`.
+//! Why this file: this is the only place in the project that performs I/O, which is what
+//!   lets the core stay a pure state machine. The `Terminal` itself lives on the pump thread
+//!   and is never shared -- the thread boundary is crossed by published frames alone, so
+//!   there is nothing to lock and no way for a renderer to observe a half-parsed sequence.
+//! NOT responsible for: parsing (`termisu-vt-core`), the frame handoff (`termisu-vt-frame`), or
+//!   drawing anything.
+//! Test strategy: `tests/child.rs` runs real programs on a real pty and asserts the frame a
+//!   renderer would draw, including that the pty is a controlling terminal (a child that
+//!   cannot open /dev/tty is the failure this would otherwise hide) and that a resize
+//!   reaches the child as SIGWINCH.
+
+use std::ffi::{CStr, CString};
+use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::thread::{self, JoinHandle};
+
+use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::fs::{Mode, OFlags};
+use rustix::io::{Errno, FdFlags, fcntl_setfd};
+use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+use rustix::termios::{Winsize, tcsetwinsize};
+use termisu_vt_core::Terminal;
+use termisu_vt_core::events::Event;
+use termisu_vt_core::graphics::ImageOp;
+use std::collections::HashMap;
+use termisu_vt_frame::{AbovePublisher, Frame, FrameReader, Publisher, ReadOutcome, channel};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Geometry {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl Geometry {
+    fn winsize(self) -> Winsize {
+        Winsize {
+            ws_row: self.rows,
+            ws_col: self.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    pub size: Geometry,
+    /// Largest geometry the shared frame buffer can carry.
+    ///
+    /// Allocated once, because growing it means replacing the buffer both threads point at.
+    /// A resize past this is reported rather than drawn wrong, and the frame the renderer
+    /// already has stays valid. Removing the ceiling is a slice 6 item.
+    pub capacity: Geometry,
+    pub scrollback: usize,
+    /// Enables screen-inspection reports in the core (DECRQCRA, WINOPS size). Off by
+    /// default -- the OSC 52-read security posture; the esctest harness is the caller.
+    pub reports: bool,
+    /// How long a synchronized-output batch (mode 2026) may stay open before the pump
+    /// publishes anyway. The anti-stuck bound, never a rendering knob: a child that opens
+    /// the gate and walks away must not freeze the display.
+    ///
+    /// Configurable because two DIFFERENT claims were being measured against one constant,
+    /// and CI proved that a test which needs the gate to hold and a test which needs the
+    /// budget to fire cannot share a number. `a_synchronized_batch_never_shows_half_drawn`
+    /// splits its batch across two pty reads 60ms apart, which left a 2.5x margin against
+    /// the 150ms default; on a shared GitHub runner that margin was crossed and the budget
+    /// correctly force-published a half-drawn frame, failing a test about the GATE for a
+    /// reason that had nothing to do with the gate. Each test now sets the budget its own
+    /// claim needs, so neither is measuring the clock.
+    pub sync_budget: std::time::Duration,
+}
+
+impl Options {
+    /// The shipped anti-stuck bound for a synchronized-output batch.
+    pub const SYNC_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
+
+    pub fn new(cols: u16, rows: u16) -> Options {
+        Options {
+            size: Geometry { cols, rows },
+            // Headroom for a window dragged larger without reallocating anything.
+            capacity: Geometry {
+                cols: cols.max(400),
+                rows: rows.max(160),
+            },
+            scrollback: 10_000,
+            reports: false,
+            // 150ms is the ecosystem's working norm for the gate, and it is the shipped
+            // behaviour: nothing in the product passes anything else.
+            sync_budget: Options::SYNC_BUDGET,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    #[error("opening a pseudoterminal failed: {0}")]
+    Pty(#[source] Errno),
+    #[error("opening the terminal device failed: {0}")]
+    Slave(#[source] Errno),
+    #[error("spawning the child failed: {0}")]
+    Child(#[source] io::Error),
+    #[error("initial size {size:?} exceeds the frame channel's capacity {capacity:?}")]
+    Capacity { size: Geometry, capacity: Geometry },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResizeError {
+    #[error("{requested:?} exceeds the frame channel's capacity {capacity:?}")]
+    ExceedsCapacity {
+        requested: Geometry,
+        capacity: Geometry,
+    },
+    #[error("resizing the pty failed: {0}")]
+    Pty(#[source] Errno),
+}
+
+impl Geometry {
+    fn fits(self, capacity: Geometry) -> bool {
+        self.cols <= capacity.cols && self.rows <= capacity.rows
+    }
+}
+
+/// A running child on a pseudoterminal, publishing frames as it produces output.
+pub struct Host {
+    master: Arc<OwnedFd>,
+    /// The device path of the pty's user side.
+    ///
+    /// Kept because a resize has to be reopened onto rather than held open: Darwin refuses
+    /// `TIOCSWINSZ` on the master (see `set_winsize`), and keeping a slave fd around instead
+    /// would mean the master never reports EOF when the child exits, since one end would
+    /// still be open in this process.
+    pts: CString,
+    child: Child,
+    pump: Option<JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    /// A geometry the pump has not applied to the terminal yet. Zero means none.
+    pending: Arc<AtomicU64>,
+    /// Scroll rows the pump has not applied yet, accumulated so a fast wheel never loses
+    /// ticks. Positive scrolls up into history; the pump swaps it to zero, clamps the
+    /// resulting offset against what history actually holds, and republishes.
+    scroll: Arc<AtomicI64>,
+    /// A pending prompt jump: +1 asks for the previous prompt, -1 for the next, 0 for none.
+    ///
+    /// Separate from `scroll` and NOT expressible as one, because the distance is not knowable
+    /// on this side: only the pump can see the history the marks live in. Latest-wins rather
+    /// than accumulating - two presses in one tick should land one prompt away, not two, and a
+    /// jump the operator can no longer see the start of is worse than a slow one.
+    jump: Arc<AtomicI64>,
+    /// The frame channel's fixed geometry ceiling; `resize` refuses anything past it.
+    capacity: Geometry,
+    /// Host-facing events the pump drained from the core (OSC 52, notifications, BEL).
+    /// A mutex, not the seqlock: events must arrive exactly once and in order, which a
+    /// lossy frame protocol cannot promise. The pump holds it for a push, microseconds.
+    events: Arc<Mutex<VecDeque<Event>>>,
+    /// The kitty image store the renderer reads: (width, height, pixels), keyed by
+    /// image id. Pixels land here ONCE and are Arc'd so a 60Hz poll clones pointers,
+    /// never megabytes.
+    images: Arc<Mutex<HashMap<u32, (u32, u32, Arc<Vec<u8>>)>>>,
+    /// The history rows directly above the viewport, for the blurred strip behind the tab
+    /// band. Its own small channel, so the main frame's row 0 stays the viewport's top.
+    above: FrameReader,
+}
+
+/// How many history rows the strip above the viewport carries. The band plus the pane's top
+/// padding is 60pt, and 8 rows cover it down to a 7.5pt cell, below any font size offered.
+pub const ABOVE_ROWS: u16 = 8;
+
+/// Sets a pty's window size, which is what raises SIGWINCH in the child.
+///
+/// Measured on macOS 2026-07-28, with raw `libc::ioctl` as well as through rustix: Darwin
+/// returns `ENOTTY` for `TIOCSWINSZ` on the **master**, and only accepts it on the user side.
+/// Reading it back works from either end. Linux accepts both, so this is the portable order
+/// rather than a workaround. Opening the slave transiently is safe -- the child holds its own
+/// descriptor, so this one is never the last.
+/// Opens, grants and unlocks a fresh pty master, CLOEXEC set, and resolves its slave
+/// path. One unit so the transient-retry in `spawn` re-runs the WHOLE acquisition -- a
+/// grantpt that failed halfway leaves a master worth abandoning, not resuming. The
+/// CLOEXEC matters because without it the child inherits the master and the pty never
+/// reports EOF: one end stays open in a process that is not reading it.
+///
+/// `ptsname` belongs INSIDE this unit, and used not to be. It is the other call that
+/// can answer ENXIO under churn, and with it outside the retry the loop guarded four
+/// of the five steps -- which is why the flake survived the retry that was meant to
+/// end it (measured 2026-07-31: still roughly one full-suite run in three).
+fn open_master() -> Result<(OwnedFd, CString), Errno> {
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    fcntl_setfd(&master, FdFlags::CLOEXEC)?;
+    let pts = ptsname(&master, Vec::new())?;
+    Ok((master, pts))
+}
+
+/// Whether a pty acquisition failure is worth retrying rather than reporting.
+///
+/// Compares the ABSOLUTE raw value, which looks paranoid and is not. Measured
+/// 2026-07-31 by instrumenting the retry loop: the errno arriving from this path on
+/// Darwin is raw **-6**, while `Errno::NXIO` is raw **6**, so the original
+/// `matches!(errno, Errno::NXIO | Errno::AGAIN)` matched nothing and the loop reported
+/// `attempt=0` at every single give-up. The retry added on 2026-07-30 had therefore
+/// never run, and the "0 failures in 5 runs" that accepted it was luck at a rate that
+/// fails about one run in four.
+///
+/// The lesson is the reusable part: a guard is not proven by the absence of the thing
+/// it suppresses. This one needed to be seen FIRING, and was not.
+fn is_transient(errno: Errno) -> bool {
+    let raw = errno.raw_os_error().abs();
+    raw == Errno::NXIO.raw_os_error() || raw == Errno::AGAIN.raw_os_error()
+}
+
+fn set_winsize(pts: &CStr, size: Geometry) -> Result<(), Errno> {
+    let slave = rustix::fs::open(pts, OFlags::RDWR | OFlags::NOCTTY, Mode::empty())?;
+    tcsetwinsize(&slave, size.winsize())
+}
+
+impl Host {
+    /// Opens a pty, starts `command` on it, and begins publishing frames.
+    pub fn spawn(
+        mut command: Command,
+        options: Options,
+    ) -> Result<(Host, FrameReader), SpawnError> {
+        // `Options::new` cannot produce this, but the fields are public. Gating here is what
+        // lets the pump treat a failed publish as a bug rather than a swallowed possibility.
+        if !options.size.fits(options.capacity) {
+            return Err(SpawnError::Capacity {
+                size: options.size,
+                capacity: options.capacity,
+            });
+        }
+        // Pty allocation can transiently fail under parallel churn -- measured
+        // 2026-07-30: ENXIO from the openpt sequence roughly once per three full-suite
+        // runs with 13 concurrent opens, and the same spawn passes alone (the sibling
+        // of 11470ca's fork EAGAIN, which the C layer already retries). Acquisition
+        // happens before the fork and touches nothing else, so retrying HERE is safe
+        // for every caller; genuine exhaustion still fails, 75ms later.
+        let (master, pts) = {
+            let mut attempt = 0;
+            loop {
+                match open_master() {
+                    Ok(acquired) => break acquired,
+                    Err(errno) if attempt < 3 && is_transient(errno) => {
+                        attempt += 1;
+                        thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(errno) => return Err(SpawnError::Pty(errno)),
+                }
+            }
+        };
+
+        let slave = rustix::fs::open(pts.as_c_str(), OFlags::RDWR | OFlags::NOCTTY, Mode::empty())
+            .map_err(SpawnError::Slave)?;
+        // On the slave, never the master -- see `set_winsize`. Before the spawn, so the
+        // child's very first `stty size` already sees the right geometry.
+        tcsetwinsize(&slave, options.size.winsize()).map_err(SpawnError::Slave)?;
+        // Open across the fork so `pre_exec` can reach it, gone by the time the child runs.
+        fcntl_setfd(&slave, FdFlags::CLOEXEC).map_err(SpawnError::Slave)?;
+        let slave_fd: RawFd = slave.as_raw_fd();
+
+        command
+            .stdin(Stdio::from(slave.try_clone().map_err(SpawnError::Child)?))
+            .stdout(Stdio::from(slave.try_clone().map_err(SpawnError::Child)?))
+            .stderr(Stdio::from(slave.try_clone().map_err(SpawnError::Child)?));
+
+        // SAFETY: `pre_exec` runs between fork and exec, where only async-signal-safe calls
+        // are legal. Both calls here are syscall wrappers that allocate nothing and take no
+        // locks: `setsid` makes the child a session leader (required before it may acquire a
+        // controlling terminal at all), and `ioctl_tiocsctty` makes the pty that terminal --
+        // which is what job control, SIGWINCH and /dev/tty all depend on. Errors are turned
+        // into an errno without formatting, so no allocation happens on the failure path
+        // either.
+        unsafe {
+            command.pre_exec(move || {
+                rustix::process::setsid().map_err(errno_to_io)?;
+                let slave = BorrowedFd::borrow_raw(slave_fd);
+                rustix::process::ioctl_tiocsctty(slave).map_err(errno_to_io)?;
+                Ok(())
+            });
+        }
+
+        let child = command.spawn().map_err(SpawnError::Child)?;
+        // The parent's copy has to go, or the master never sees the child's side close.
+        drop(slave);
+
+        let master = Arc::new(master);
+        let (writer, reader) = channel(options.capacity.cols, options.capacity.rows);
+        let (above_writer, above) = channel(options.capacity.cols, ABOVE_ROWS);
+        let stop = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicU64::new(0));
+
+        let events: Arc<Mutex<VecDeque<Event>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let images: Arc<Mutex<HashMap<u32, (u32, u32, Arc<Vec<u8>>)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let scroll = Arc::new(AtomicI64::new(0));
+        let jump = Arc::new(AtomicI64::new(0));
+        let pump = thread::Builder::new()
+            .name("termisu-vt-pty".to_string())
+            .spawn({
+                let master = Arc::clone(&master);
+                let stop = Arc::clone(&stop);
+                let pending = Arc::clone(&pending);
+                let events = Arc::clone(&events);
+                let images = Arc::clone(&images);
+                let scroll = Arc::clone(&scroll);
+                let jump = Arc::clone(&jump);
+                move || {
+                    pump(
+                        master,
+                        Publisher::new(writer),
+                        AbovePublisher::new(above_writer),
+                        options,
+                        stop,
+                        pending,
+                        events,
+                        images,
+                        scroll,
+                        jump,
+                    )
+                }
+            })
+            .map_err(SpawnError::Child)?;
+
+        Ok((
+            Host {
+                master,
+                pts,
+                child,
+                pump: Some(pump),
+                stop,
+                pending,
+                capacity: options.capacity,
+                events,
+                images,
+                scroll,
+                jump,
+                above,
+            },
+            reader,
+        ))
+    }
+
+    /// Sends input to the child, as a keyboard would.
+    /// Reads the latest strip of history rows above the viewport (see `ABOVE_ROWS`).
+    pub fn read_above(&self, frame: &mut Frame) -> ReadOutcome {
+        self.above.read_into(frame)
+    }
+
+    /// The kitty image store the pump maintains; the renderer resolves placements
+    /// against it. Cloned Arc -- cheap, shared, read-locked briefly per draw.
+    pub fn image_store(&self) -> Arc<Mutex<HashMap<u32, (u32, u32, Arc<Vec<u8>>)>>> {
+        Arc::clone(&self.images)
+    }
+
+    /// Drains the events the pump has collected (OSC 52, notifications, BEL), oldest
+    /// first. Exactly-once: what this returns is gone from the queue.
+    pub fn take_events(&self) -> Vec<Event> {
+        let mut queue = self.events.lock().expect("event queue");
+        queue.drain(..).collect()
+    }
+
+    /// Scrolls the published view by `rows`: positive climbs into history, negative moves
+    /// back toward the live bottom. Deltas accumulate until the pump's next tick (at most
+    /// one TICK away), and the pump clamps the result to what history actually holds --
+    /// the caller never needs to know the scrollback length.
+    pub fn scroll(&self, rows: i32) {
+        self.scroll.fetch_add(i64::from(rows), Ordering::Relaxed);
+    }
+
+    /// Returns the view to the live bottom. A subtraction larger than any reachable
+    /// offset rather than a store, so a wheel tick racing this call is absorbed by the
+    /// pump's clamp instead of being overwritten.
+    pub fn scroll_to_bottom(&self) {
+        self.scroll.fetch_sub(1 << 40, Ordering::Relaxed);
+    }
+
+    /// Asks the pump to move the view to the nearest OSC 133 prompt mark: `back` climbs into
+    /// history to the previous command, otherwise it returns toward the newest.
+    ///
+    /// A STORE, unlike `scroll`'s accumulating add. Two presses inside one 16ms tick mean the
+    /// operator wants to be one prompt away and pressed twice, not two prompts away - and the
+    /// distances are not addable anyway, since each depends on where the previous jump landed.
+    ///
+    /// Silently does nothing when there is no prompt in that direction (no shell integration,
+    /// or already at the oldest mark). That is the pump's decision to make, because only it can
+    /// see the history; the alternative is this call blocking on an answer, which would put the
+    /// GUI thread behind a pty read.
+    pub fn jump_to_prompt(&self, back: bool) {
+        self.jump.store(if back { 1 } else { -1 }, Ordering::Relaxed);
+    }
+
+    pub fn send(&self, bytes: &[u8]) -> Result<(), Errno> {
+        let mut written = 0;
+        while written < bytes.len() {
+            match rustix::io::write(&*self.master, &bytes[written..]) {
+                Ok(0) => return Err(Errno::IO),
+                Ok(n) => written += n,
+                Err(Errno::INTR) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Resizes the pty, which is what raises SIGWINCH in the child.
+    ///
+    /// The terminal's own geometry follows on the pump thread, since that is where it lives.
+    /// A geometry past the channel's capacity is refused BEFORE the pty sees it -- the child
+    /// never learns of a size no frame could carry, the renderer's frame stays valid, and the
+    /// caller gets the report `Options` promises instead of a permanently frozen display
+    /// (finding 16: three publishes failing into `let _ =`).
+    pub fn resize(&self, size: Geometry) -> Result<(), ResizeError> {
+        if !size.fits(self.capacity) {
+            return Err(ResizeError::ExceedsCapacity {
+                requested: size,
+                capacity: self.capacity,
+            });
+        }
+        // Posted BEFORE the pty learns the size. The child's redraw is a reaction to the
+        // SIGWINCH that `set_winsize` raises, so the pump must already be able to see the new
+        // geometry when those bytes arrive; posting after left a window in which the redraw
+        // of a bottom-anchored TUI was parsed at the old height (2026-10-02).
+        let request = u64::from(size.cols) | (u64::from(size.rows) << 16) | (1 << 32);
+        self.pending.store(request, Ordering::Relaxed);
+        if let Err(error) = set_winsize(&self.pts, size) {
+            // The child never learned this size, so the terminal must not wear it either.
+            // Withdrawn only if the pump has not taken it yet and no newer resize replaced it.
+            let _ = self.pending.compare_exchange(request, 0, Ordering::Relaxed, Ordering::Relaxed);
+            return Err(ResizeError::Pty(error));
+        }
+        Ok(())
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Kills the child, reaps it, and stops the pump. Idempotent; `Drop` calls it.
+    ///
+    /// **The order is the whole fix, and it was wrong until 2026-08-08.** This used to stop and
+    /// JOIN the pump first and kill the child afterwards, which deadlocks: the pump is the only
+    /// reader of the pty master, and a child exiting with a controlling terminal blocks in the
+    /// kernel until its tty output queue drains. Stop reading, and a child with anything still
+    /// queued can never finish exiting, so `wait` never returns. Measured by the discriminating
+    /// pair that names the cause exactly: 120 spawn-and-shutdown rounds with a SILENT child pass
+    /// in 0.74s, and the same loop with a child that prints one line before going quiet hangs
+    /// within 40. The stuck child shows up in `ps` as state `?Es` - trying to exit - while the
+    /// parent sits in `__wait4`. **The reader must outlive the child.**
+    ///
+    /// The reap is also BOUNDED, which is a separate guarantee and the more important one: a
+    /// shutdown that can block forever is a defect whatever the ordering, because it takes the
+    /// caller's thread with it. This one hung a test suite for seven and a half hours before it
+    /// was found, holding pty children the whole time. If the child somehow does not die inside
+    /// the grace period, it is abandoned rather than waited on - a leaked process is recoverable
+    /// and a wedged UI thread is not.
+    pub fn shutdown(&mut self) {
+        // Kill FIRST and leave the pump running: it keeps draining the master while the child
+        // works through its own exit path.
+        let _ = self.child.kill();
+        self.reap_within(SHUTDOWN_GRACE);
+
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(pump) = self.pump.take() {
+            let _ = pump.join();
+        }
+    }
+
+    /// Waits for the child to be reaped, giving up after `grace`.
+    ///
+    /// `Child::wait` has no timeout, so this polls. The sleep is short enough that an ordinary
+    /// shutdown costs one interval and long enough that a slow exit is not a spin.
+    fn reap_within(&mut self, grace: std::time::Duration) {
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn errno_to_io(errno: Errno) -> io::Error {
+    io::Error::from_raw_os_error(errno.raw_os_error())
+}
+
+/// How long `shutdown` will wait for a killed child to be reaped before abandoning it.
+///
+/// Generous, because the ordinary case returns on the first poll and this bound exists only for
+/// the pathological one: a child that cannot finish exiting. Abandoning it leaks a process that
+/// the OS reparents; blocking on it leaks the caller's thread, which is worse.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the pump waits for output before looking at its own mailbox.
+///
+/// A resize with a silent child would otherwise sit unapplied until the child next said
+/// something, which for a program parked at a prompt can be forever.
+const TICK: Timespec = Timespec {
+    tv_sec: 0,
+    tv_nsec: 16_000_000,
+};
+
+fn pump(
+    master: Arc<OwnedFd>,
+    mut publisher: Publisher,
+    mut above: AbovePublisher,
+    options: Options,
+    stop: Arc<AtomicBool>,
+    pending: Arc<AtomicU64>,
+    events: Arc<Mutex<VecDeque<Event>>>,
+    images: Arc<Mutex<HashMap<u32, (u32, u32, Arc<Vec<u8>>)>>>,
+    scroll: Arc<AtomicI64>,
+    jump: Arc<AtomicI64>,
+) {
+    let mut terminal =
+        Terminal::with_scrollback(options.size.cols, options.size.rows, options.scrollback);
+    terminal.enable_reports(options.reports);
+    // Without this, a child-driven resize (DECCOLM, WINOPS 8) could outgrow the frame
+    // channel and turn the GATED expect below into a child-triggerable panic.
+    terminal.set_child_resize_ceiling(options.capacity.cols, options.capacity.rows);
+    let mut buffer = vec![0u8; 64 * 1024];
+
+    // Synchronized output (mode 2026): while the child holds the gate, reads parse but
+    // do not publish, so a renderer never shows a half-drawn batch. The budget is the
+    // anti-stuck bound -- a child that never closes its batch (crashed mid-escape, or
+    // simply hostile) gets force-published at this cadence rather than freezing the
+    // display. Default and shipped value: `Options::SYNC_BUDGET`.
+    let sync_budget = options.sync_budget;
+    let mut sync_since: Option<std::time::Instant> = None;
+
+    // The viewport: how many rows the published view is scrolled up into history. Lives
+    // here because the pump owns the terminal -- the GUI thread only ever sends deltas.
+    let mut offset: usize = 0;
+    // The pushed-counter reading the current `offset` was computed against. While
+    // scrolled, rows entering history push the offset up by the same amount, which is
+    // what keeps the view pinned to its CONTENT while the child keeps printing --
+    // watching `history.len()` instead drifts one row per prune once the budget is met.
+    let mut anchored_pushed: u64 = 0;
+
+    // Every geometry the terminal can wear is gated against the channel's capacity at spawn
+    // and at resize, so a failed publish is a bug in that gating -- swallowing it here is how
+    // finding 16 froze the display permanently. The expect makes the bug loud instead.
+    const GATED: &str = "geometry is gated at spawn and resize, so every frame fits the channel";
+
+    // The child may have been given a geometry it has not printed anything for yet; publish
+    // once so a renderer attaching immediately has a frame rather than nothing.
+    publisher.publish(&mut terminal).expect(GATED);
+    above.publish(&terminal, 0).expect(GATED);
+
+    // Applies a posted resize, if any. Called at the top of the loop AND right before
+    // parsing what was read: a child answers SIGWINCH with a redraw, and those bytes must
+    // be parsed at the size the child drew them for, not after the next 16ms tick.
+    let apply_resize = |terminal: &mut Terminal,
+                        publisher: &mut Publisher,
+                        above: &mut AbovePublisher,
+                        offset: &mut usize,
+                        anchored_pushed: &mut u64| {
+        let requested = pending.swap(0, Ordering::Relaxed);
+        if requested & (1 << 32) != 0 {
+            terminal.resize(requested as u16, (requested >> 16) as u16);
+            // A reflow re-lays the very rows a scrolled view was anchored to (and re-pushes
+            // the whole history, inflating the counter). v1 snaps to the live bottom rather
+            // than guessing an anchor; a reflow-riding viewport anchor is a backlog slice,
+            // the same class images-v2 solved for placements.
+            *offset = 0;
+            *anchored_pushed = terminal.screen().history.total_pushed();
+            publisher.publish(terminal).expect(GATED);
+            above.publish(terminal, 0).expect(GATED);
+        }
+    };
+
+    while !stop.load(Ordering::Relaxed) {
+        apply_resize(&mut terminal, &mut publisher, &mut above, &mut offset, &mut anchored_pushed);
+
+        let delta = scroll.swap(0, Ordering::Relaxed);
+        if delta != 0 {
+            let limit = terminal.screen().history.len();
+            let next = (offset as i64).saturating_add(delta).clamp(0, limit as i64) as usize;
+            if next != offset {
+                offset = next;
+                publisher
+                    .publish_scrolled(&mut terminal, offset as u32)
+                    .expect(GATED);
+                above.publish(&terminal, offset as u32).expect(GATED);
+            }
+        }
+
+        // Prompt jumping. Resolved HERE and nowhere else, because the marks live in the
+        // history this thread owns - the GUI side can only say which direction it wants.
+        //
+        // Refused outright on the alternate screen: a full-screen program has no scrollback
+        // and no prompts, so jumping there would move a viewport that is not scrollable and
+        // land on marks belonging to the primary screen underneath it.
+        let direction = jump.swap(0, Ordering::Relaxed);
+        if direction != 0 && !terminal.on_alternate_screen() {
+            let offsets = terminal.screen().history.prompt_offsets();
+            // `None` means no mark in that direction - stay exactly where we are. Deliberately
+            // NOT a clamp to the nearest end: turning a jump into a scroll-to-top would move
+            // the operator somewhere they never asked to go.
+            if let Some(next) =
+                termisu_vt_core::history::prompt_jump_offset(&offsets, offset, direction > 0)
+            {
+                offset = next;
+                anchored_pushed = terminal.screen().history.total_pushed();
+                publisher
+                    .publish_scrolled(&mut terminal, offset as u32)
+                    .expect(GATED);
+                above.publish(&terminal, offset as u32).expect(GATED);
+            }
+        }
+
+        let mut fds = [PollFd::new(&*master, PollFlags::IN)];
+        match rustix::event::poll(&mut fds, Some(&TICK)) {
+            Ok(0) => {
+                // A held batch whose budget ran out publishes even though the child went
+                // quiet -- the quiet child is exactly the stuck case the budget exists for.
+                if let Some(since) = sync_since {
+                    if since.elapsed() >= sync_budget {
+                        sync_since = Some(std::time::Instant::now());
+                        publisher
+                            .publish_scrolled(&mut terminal, offset as u32)
+                            .expect(GATED);
+                        above.publish(&terminal, offset as u32).expect(GATED);
+                    }
+                }
+                continue;
+            }
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
+            Err(_) => break,
+        }
+
+        match rustix::io::read(&*master, &mut buffer[..]) {
+            // A pty reports the child's side closing as EIO on macOS and as a zero-length
+            // read elsewhere. Both mean the same thing here.
+            Ok(0) | Err(Errno::IO) => break,
+            Ok(read) => {
+                apply_resize(&mut terminal, &mut publisher, &mut above, &mut offset, &mut anchored_pushed);
+                terminal.write(&buffer[..read]);
+                // DSR/DA replies are owed to the CHILD, ordered against its own
+                // output; they go straight back down the pty before the frame ships.
+                let owed = terminal.take_replies();
+                if !owed.is_empty() {
+                    let mut rest = &owed[..];
+                    while !rest.is_empty() {
+                        match rustix::io::write(&*master, rest) {
+                            Ok(0) => break,
+                            Ok(wrote) => rest = &rest[wrote..],
+                            Err(Errno::INTR) | Err(Errno::AGAIN) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let image_ops = terminal.take_image_ops();
+                if !image_ops.is_empty() {
+                    let mut store = images.lock().expect("image store");
+                    for op in image_ops {
+                        match op {
+                            ImageOp::Add(id, image) => {
+                                store.insert(
+                                    id,
+                                    (image.width, image.height, Arc::new(image.rgba)),
+                                );
+                            }
+                            ImageOp::Remove(id) => {
+                                store.remove(&id);
+                            }
+                            ImageOp::Clear => store.clear(),
+                        }
+                    }
+                }
+                let drained = terminal.take_events();
+                if !drained.is_empty() {
+                    // Bounded by the core's own cap; a reader that never drains cannot
+                    // grow this past one core-queue worth per lock.
+                    let mut queue = events.lock().expect("event queue");
+                    queue.extend(drained);
+                    let excess = queue.len().saturating_sub(256);
+                    if excess > 0 {
+                        queue.drain(..excess);
+                    }
+                }
+                // Pin the scrolled view to its content: rows that just entered history
+                // slide the offset up by the same count, clamped to what survives the
+                // prune. Saturating because a screen SWITCH (alt has its own zero-budget
+                // history) can move the counter backwards between reads.
+                let pushed = terminal.screen().history.total_pushed();
+                if offset > 0 {
+                    offset = offset
+                        .saturating_add(pushed.saturating_sub(anchored_pushed) as usize)
+                        .min(terminal.screen().history.len());
+                }
+                anchored_pushed = pushed;
+                // The synchronized-output gate: hold the frame while the batch is open,
+                // publish when it closes (this very read is usually the `2026l`), and
+                // force one through when the budget expires so the display can never be
+                // frozen by a child that forgets to close.
+                let publish_now = if terminal.synchronized_output() {
+                    let since = *sync_since.get_or_insert_with(std::time::Instant::now);
+                    since.elapsed() >= sync_budget
+                } else {
+                    sync_since = None;
+                    true
+                };
+                if publish_now {
+                    if sync_since.is_some() {
+                        sync_since = Some(std::time::Instant::now());
+                    }
+                    publisher
+                        .publish_scrolled(&mut terminal, offset as u32)
+                        .expect(GATED);
+                    above.publish(&terminal, offset as u32).expect(GATED);
+                }
+            }
+            Err(Errno::INTR) | Err(Errno::AGAIN) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The predicate that decides whether a pty acquisition is retried.
+    ///
+    /// This exists because the retry it guards was dead for a day: the errno this path
+    /// produces on Darwin arrives NEGATED, so a `matches!` against `Errno::NXIO` was
+    /// false every time and the loop gave up at `attempt=0`. Asserting the negative
+    /// form directly is what makes the guard proven rather than assumed -- the raw
+    /// value below is the one an instrumented run actually printed on 2026-07-31.
+    #[test]
+    fn the_retry_predicate_accepts_the_negated_errno_darwin_reports() {
+        assert!(
+            is_transient(Errno::from_raw_os_error(-6)),
+            "raw -6 is the ENXIO this pty path really reports; refusing it is what made \
+             the retry dead code"
+        );
+        // Both signs, so a platform reporting the ordinary positive form still retries.
+        assert!(is_transient(Errno::NXIO));
+        assert!(is_transient(Errno::AGAIN));
+        assert!(is_transient(Errno::from_raw_os_error(-35)));
+        // And it must still refuse what is not transient, or it would retry real errors.
+        assert!(!is_transient(Errno::NOTTY));
+        assert!(!is_transient(Errno::PERM));
+    }
+}

@@ -1,0 +1,4 @@
+module CTermisuHost {
+    header "../../../crates/host/include/termisu_host.h"
+    export *
+}
